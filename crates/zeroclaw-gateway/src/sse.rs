@@ -33,7 +33,10 @@ impl EventBuffer {
 
     /// Push an event into the buffer, evicting the oldest if at capacity.
     pub fn push(&self, event: serde_json::Value) {
-        let mut buf = self.inner.lock().unwrap();
+        let mut buf = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if buf.len() == self.capacity {
             buf.pop_front();
         }
@@ -42,7 +45,11 @@ impl EventBuffer {
 
     /// Return a snapshot of all buffered events (oldest first).
     pub fn snapshot(&self) -> Vec<serde_json::Value> {
-        self.inner.lock().unwrap().iter().cloned().collect()
+        let buf = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        buf.iter().cloned().collect()
     }
 }
 
@@ -199,6 +206,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 messages_count,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
             } => {
                 let mut json = serde_json::json!({
@@ -211,6 +219,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 });
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
                 json
             }
@@ -220,6 +229,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 success,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
                 ..
             } => {
@@ -233,6 +243,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 });
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
                 json
             }
@@ -240,6 +251,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 tool,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
                 ..
             } => {
@@ -251,6 +263,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 });
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
                 json
             }
@@ -369,6 +382,25 @@ mod tests {
     // within this test binary so they don't observe each other's state.
     static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+    #[test]
+    fn event_buffer_recovers_after_a_poisoned_writer() {
+        let buffer = Arc::new(EventBuffer::new(4));
+        let poisoned = buffer.clone();
+        let result = std::thread::spawn(move || {
+            let mut guard = poisoned.inner.lock().expect("fresh buffer must lock");
+            guard.push_back(serde_json::json!({"sequence": 1}));
+            panic!("poison event buffer");
+        })
+        .join();
+        assert!(result.is_err());
+
+        buffer.push(serde_json::json!({"sequence": 2}));
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0]["sequence"], 1);
+        assert_eq!(snapshot[1]["sequence"], 2);
+    }
+
     fn make_broadcast() -> (
         Arc<BroadcastObserver>,
         tokio::sync::broadcast::Receiver<serde_json::Value>,
@@ -385,6 +417,7 @@ mod tests {
         let (obs, mut rx, buffer) = make_broadcast();
 
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: std::time::Duration::from_millis(42),
@@ -411,6 +444,7 @@ mod tests {
         let (obs, mut rx, _buffer) = make_broadcast();
 
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "mcp_filesystem__read_file".into(),
             tool_call_id: None,
             arguments: None,
@@ -614,6 +648,7 @@ mod tests {
 
         let cases: Vec<ObserverEvent> = vec![
             ObserverEvent::LlmRequest {
+                parent_agent_alias: None,
                 model_provider: "p".into(),
                 model: "m".into(),
                 messages_count: 0,
@@ -622,6 +657,7 @@ mod tests {
                 turn_id: None,
             },
             ObserverEvent::ToolCall {
+                parent_agent_alias: None,
                 tool: "shell".into(),
                 tool_call_id: None,
                 duration: std::time::Duration::from_millis(1),
@@ -633,6 +669,7 @@ mod tests {
                 turn_id: None,
             },
             ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
                 tool: "shell".into(),
                 tool_call_id: None,
                 arguments: None,
@@ -691,6 +728,7 @@ mod tests {
         let observer = zeroclaw_runtime::observability::create_observer(&cfg);
 
         observer.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: std::time::Duration::from_millis(7),

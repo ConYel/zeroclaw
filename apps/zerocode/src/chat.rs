@@ -16,7 +16,9 @@ use ratatui::{
 };
 use tokio::sync::{broadcast, mpsc};
 
-use crate::attachment::{PendingAttachment, build_attachments_json, cleanup_attachment_temps};
+use crate::attachment::{
+    CleanupReport, PendingAttachment, build_attachments_json, cleanup_attachment_temps,
+};
 use crate::client::{
     ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionUpdate, TurnEndOutcome,
     method, parse_session_update,
@@ -26,6 +28,12 @@ use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{InputBarAction, InputBarState};
 use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
+#[cfg(test)]
+use crate::text_selection::{CellPoint, TextCell as TranscriptCell, row_breaks_for_line};
+use crate::text_selection::{
+    TextRowBreak as TranscriptRowBreak, TextSelection as TranscriptSelection,
+    TextSnapshot as TranscriptSnapshot, borrow_line, row_breaks_for_lines, wrapped_rows,
+};
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
@@ -36,6 +44,17 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 /// How often the cwd line re-polls the daemon for the current git branch.
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
+const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+
+fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String {
+    if let Some(cleanup) = cleanup {
+        if !message.is_empty() {
+            message.push_str("; ");
+        }
+        message.push_str(&cleanup);
+    }
+    message
+}
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -121,13 +140,17 @@ pub(crate) struct Chat {
     /// Double-click tracker for the session picker: a second click on the same row
     /// resumes that saved session, matching the keyboard Enter.
     session_list_double_click: crate::mouse::DoubleClickTracker,
-    /// Parsed `[todotracker]` config, fetched once (lazily, on first
-    /// session start) and applied to every `ChatState` this pane
-    /// constructs. Defaults until fetched.
-    todo_settings: crate::todo_tracker::TodoTrackerSettings,
-    /// Guards the one-shot `[todotracker]` config fetch so it doesn't
-    /// repeat on every session start.
-    todo_settings_loaded: bool,
+    /// One-shot app-level Help request, set by the `/help` slash command and
+    /// drained immediately by `app.rs` after this pane handles the key.
+    help_requested: bool,
+    /// Inbound `elicitation/create` requests that arrived while the pane was
+    /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
+    /// Rather than auto-cancel a legitimately-owned prompt during that
+    /// transient window — which silently drops the agent's `ask_user` — we
+    /// hold it here and retry installation on subsequent drains until it
+    /// either matches (modal installed) or its grace deadline expires (then
+    /// answered `cancel`, unblocking the daemon's tool call). See
+    /// `drain_inbound_requests` / `try_install_elicitation`.
     deferred_elicitations: Vec<DeferredInboundRequest>,
 }
 
@@ -199,8 +222,7 @@ impl Chat {
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
-            todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
-            todo_settings_loaded: false,
+            help_requested: false,
             deferred_elicitations: Vec::new(),
         }
     }
@@ -413,14 +435,38 @@ impl Chat {
         }
     }
 
-    async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        if !self.todo_settings_loaded {
-            self.todo_settings_loaded = true;
-            if let Ok(fields) = self.rpc.config_list(Some("todotracker")).await {
-                self.todo_settings =
-                    crate::todo_tracker::TodoTrackerSettings::from_config_fields(&fields);
+    /// Resolve the local `[todotracker]` settings from `zerocode-config.toml`.
+    /// Called at every session boundary (new / restart / switch) so the file
+    /// stays the single source of truth and a Config-pane save takes effect on
+    /// the next transition.
+    ///
+    /// On a load failure (e.g. an invalid `ZEROCODE_todotracker__*` override or
+    /// a malformed section) the `fallback` is returned rather than hard
+    /// defaults, so a transient error does not silently reset a user's tracker
+    /// layout/visibility to the built-ins. The failure is logged so it can be
+    /// diagnosed.
+    fn resolve_todo_settings(
+        fallback: crate::todo_tracker::TodoTrackerSettings,
+    ) -> crate::todo_tracker::TodoTrackerSettings {
+        match crate::config::resolve_todo_tracker_checked(&crate::i18n::config_dir()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!(
+                    "zerocode: resolving [todotracker] failed ({error:#}); keeping current settings"
+                );
+                fallback
             }
         }
+    }
+
+    async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
+        // TodoWrite display is a ZeroCode UI concern owned by
+        // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
+        // — so read it from the local config file (honoring `--config-dir` /
+        // `ZEROCLAW_CONFIG_DIR`), not over RPC. A fresh pane has no prior
+        // tracker, so a load failure falls back to the built-in defaults.
+        let todo_settings =
+            Self::resolve_todo_settings(crate::todo_tracker::TodoTrackerSettings::default());
 
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
@@ -456,15 +502,16 @@ impl Chat {
         match result {
             Ok(session) => {
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
-                let mut state = ChatState::new(
+                // `todo_settings` is resolved fresh at this boundary from
+                // `zerocode-config.toml` (the canonical owner); the removed
+                // `self.todo_settings` cache was the stale cross-session copy.
+                let mut state = ChatState::with_shared_commands(
                     session.session_id,
                     agent_alias.to_string(),
-                    self.todo_settings,
+                    todo_settings,
+                    self.rpc.commands(),
                 );
-                // Only ACP shows the working directory above the input bar.
-                if self.pane_kind == PaneKind::Acp {
-                    state.cwd = session.workspace_dir;
-                }
+                state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
@@ -472,7 +519,7 @@ impl Chat {
                 if let Some(sid) = resumed_sid
                     && let Ok(msgs) = self.rpc.session_messages(&sid).await
                 {
-                    state.load_history(msgs.messages);
+                    state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -557,10 +604,9 @@ impl Chat {
             Ok(s) => {
                 let old_session_id = state.session_id.clone();
                 let _ = rpc.session_close(&old_session_id).await;
-                state.reset_for_session(s.session_id, None);
-                if pane_kind == PaneKind::Acp {
-                    state.cwd = s.workspace_dir;
-                }
+                let current = state.todo_tracker.settings();
+                state.reset_for_session(s.session_id, None, Self::resolve_todo_settings(current));
+                state.cwd = s.workspace_dir;
                 Self::refresh_model_identity(rpc, state).await;
                 state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
             }
@@ -804,31 +850,129 @@ impl Chat {
         }
     }
 
+    async fn cancel_active_turn_for_injection(&mut self) {
+        let session_id = match self.phase {
+            ChatPhase::Active(ref state)
+                if state.turn_in_flight && !matches!(state.turn_status, TurnStatus::Cancelling) =>
+            {
+                state.session_id.clone()
+            }
+            _ => return,
+        };
+        let result = self.rpc.session_cancel(&session_id).await;
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            if result.is_ok() {
+                state.enter_cancelling();
+            } else {
+                state.commit_turn(String::new(), false);
+            }
+        }
+    }
+
+    async fn execute_context_menu_request(&mut self, request: ChatContextMenuRequest) {
+        match request {
+            ChatContextMenuRequest::CopyTranscript(target) => {
+                let ChatPhase::Active(ref mut state) = self.phase else {
+                    return;
+                };
+                if !state.copy_text_and_clear_selection(&target.text) {
+                    return;
+                }
+                match target.kind {
+                    CopyHitKind::Code => {
+                        state.set_copy_feedback(CopyFeedbackTarget::Code(target.group));
+                    }
+                    CopyHitKind::Message | CopyHitKind::Transcript => {
+                        state.set_overlay_copy_feedback(target.rect);
+                    }
+                }
+            }
+            ChatContextMenuRequest::Queue { id, action } => match action {
+                ChatContextMenuAction::SendNow => {
+                    let promoted = match self.phase {
+                        ChatPhase::Active(ref mut state) => state.promote_queued_by_id(id),
+                        _ => false,
+                    };
+                    if promoted {
+                        self.cancel_active_turn_for_injection().await;
+                        self.pump_queue();
+                    }
+                }
+                ChatContextMenuAction::Copy => {
+                    let ChatPhase::Active(ref mut state) = self.phase else {
+                        return;
+                    };
+                    let Some(text) = state.queued_text(id).filter(|text| !text.is_empty()) else {
+                        return;
+                    };
+                    crate::mouse::copy_osc52(&text);
+                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                }
+                ChatContextMenuAction::Edit => {
+                    let ChatPhase::Active(ref mut state) = self.phase else {
+                        return;
+                    };
+                    let composer_busy = !state.input_bar.input().trim().is_empty()
+                        || state.input_bar.has_pending_attachments();
+                    if composer_busy {
+                        state
+                            .entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                "zc-queue-edit-busy",
+                            ))));
+                        state.mark_dirty_append();
+                    } else if let Some((text, attachments)) = state.take_queued_for_edit(id) {
+                        state.input_bar.load_for_edit(text, attachments);
+                    }
+                }
+                ChatContextMenuAction::Delete => {
+                    if let ChatPhase::Active(ref mut state) = self.phase {
+                        state.delete_queued_by_id(id);
+                    }
+                }
+            },
+        }
+    }
+
     fn pump_queue(&mut self) {
         let next = match self.phase {
             ChatPhase::Active(ref mut state) => state.take_next_dispatchable(),
             _ => None,
         };
-        let Some(msg) = next else { return };
+        let Some(QueuedMessage {
+            text, attachments, ..
+        }) = next
+        else {
+            return;
+        };
         let sid = match self.phase {
             ChatPhase::Active(ref state) => state.session_id.clone(),
-            _ => return,
+            _ => {
+                let _ = cleanup_attachment_temps(&attachments);
+                return;
+            }
         };
 
         let transport = self.rpc.transport();
-        let attachments_json = if msg.attachments.is_empty() {
+        let attachments_json = if attachments.is_empty() {
             Vec::new()
         } else {
-            match build_attachments_json(&msg.attachments, transport) {
+            match build_attachments_json(&attachments, transport) {
                 Ok(json) => json,
                 Err(e) => {
                     if let ChatPhase::Active(ref mut state) = self.phase {
+                        let cleanup_report = cleanup_attachment_temps(&attachments);
+                        state.surface_cleanup_report(cleanup_report);
                         state
                             .entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(
                                 crate::i18n::t_args(
                                     "zc-queue-dispatch-failed",
-                                    &[("error", &e.to_string())],
+                                    // The anyhow context includes the local
+                                    // attachment path. Keep it out of the
+                                    // transcript; the cleanup notice already
+                                    // reports the bounded, actionable count.
+                                    &[("error", &e.root_cause().to_string())],
                                 ),
                             )));
                         state.mark_dirty_append();
@@ -839,16 +983,19 @@ impl Chat {
         };
 
         if let ChatPhase::Active(ref mut state) = self.phase {
-            let att_names: Vec<String> =
-                msg.attachments.iter().map(|a| a.filename.clone()).collect();
-            let text = if msg.text.is_empty() {
+            let att_names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
+            let prompt = if text.is_empty() {
                 None
             } else {
-                Some(msg.text.clone())
+                Some(text.clone())
             };
-            state.push_user_message(text, att_names);
+            state.own_active_turn_attachments(attachments);
+            state.push_user_message(prompt, att_names);
+        } else {
+            let _ = cleanup_attachment_temps(&attachments);
+            return;
         }
-        self.spawn_prompt(sid, msg.text, attachments_json);
+        self.spawn_prompt(sid, text, attachments_json);
     }
 
     fn spawn_prompt(&self, sid: String, prompt: String, attachments_json: Vec<serde_json::Value>) {
@@ -967,7 +1114,7 @@ impl Chat {
                 explorer.render(frame, area);
             }
             ChatPhase::Active(state) => {
-                render(frame, state, area);
+                render(frame, state, area, self.pane_kind);
             }
             ChatPhase::Error(msg) => {
                 draw_error(frame, area, msg, &self.pane_kind.name());
@@ -1271,6 +1418,40 @@ impl Chat {
             return false;
         }
 
+        // The transcript or queue context menu is modal within an active chat. Handle
+        // it before selection clearing or input dispatch so Esc cannot leak
+        // into the editor and Enter cannot submit a prompt.
+        if state.context_menu.is_some() {
+            use crate::keymap::ModalAction;
+            let request = match ModalAction::from_chord(&key) {
+                Some(ModalAction::Up) => {
+                    state.context_menu_select_step(-1);
+                    None
+                }
+                Some(ModalAction::Down) => {
+                    state.context_menu_select_step(1);
+                    None
+                }
+                Some(ModalAction::Confirm) => state.take_context_menu_request(),
+                Some(ModalAction::Cancel) => {
+                    state.dismiss_context_menu();
+                    None
+                }
+                _ => None,
+            };
+            if let Some(request) = request {
+                self.execute_context_menu_request(request).await;
+            }
+            return false;
+        }
+
+        // Input-bar overlays are modal within the input surface. Higher
+        // overlays above have already had first refusal; handle them before
+        // queue, browse, and other pane-level shortcuts.
+        if state.handle_input_bar_overlay_key(key) {
+            return false;
+        }
+
         {
             use crate::keymap::ChatTabAction as QAction;
             let qaction = QAction::from_chord(&key);
@@ -1295,22 +1476,22 @@ impl Chat {
                     state.queue_select_step(1);
                     return false;
                 }
-                Some(QAction::QueueDelete) if state.queue_sidebar_open() => {
-                    state.delete_selected_queued();
-                    return false;
-                }
-                Some(QAction::QueueEdit) if state.queue_sidebar_open() => {
-                    let bar_busy = !state.input_bar.input().trim().is_empty()
-                        || state.input_bar.has_pending_attachments();
-                    if bar_busy {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-queue-edit-busy",
-                            ))));
-                        state.mark_dirty_append();
-                    } else if let Some((text, attachments)) = state.take_selected_for_edit() {
-                        state.input_bar.load_for_edit(text, attachments);
+                Some(
+                    action @ (QAction::QueueSendNow
+                    | QAction::QueueCopy
+                    | QAction::QueueDelete
+                    | QAction::QueueEdit),
+                ) if state.queue_sidebar_open() => {
+                    let action = match action {
+                        QAction::QueueSendNow => ChatContextMenuAction::SendNow,
+                        QAction::QueueCopy => ChatContextMenuAction::Copy,
+                        QAction::QueueEdit => ChatContextMenuAction::Edit,
+                        QAction::QueueDelete => ChatContextMenuAction::Delete,
+                        _ => unreachable!(),
+                    };
+                    if let Some(id) = state.selected_queue_id() {
+                        let request = ChatContextMenuRequest::Queue { id, action };
+                        self.execute_context_menu_request(request).await;
                     }
                     return false;
                 }
@@ -1324,6 +1505,14 @@ impl Chat {
                 }
                 _ => {}
             }
+        }
+
+        // Copy must run before the general "any key clears mouse highlight"
+        // path below. Otherwise Command+C / Ctrl+Shift+C would erase a
+        // character-level transcript selection before extracting it.
+        if should_copy_current_selection(state, &key) {
+            state.copy_current_selection();
+            return false;
         }
 
         // Any key press clears the mouse-click highlight — the user is done
@@ -1349,6 +1538,7 @@ impl Chat {
                             | ChatTabAction::BrowseSelectExtendDown
                             | ChatTabAction::BrowseExitSelection
                             | ChatTabAction::CopySelection
+                            | ChatTabAction::CopyAllVisible
                     )
                 )
             };
@@ -1371,7 +1561,7 @@ impl Chat {
 
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
-        if state.pending_approval().is_none() && !state.in_browse_mode() {
+        if state.composer_owns_text_input() {
             let action = state.input_bar.handle_key(key);
             match action {
                 InputBarAction::Submit { text, attachments } => {
@@ -1386,25 +1576,15 @@ impl Chat {
                     state.clear_info_notice();
                     let prompt = text.unwrap_or_default();
                     let enq = state.inject_message(prompt, attachments);
-                    if enq.is_ok()
-                        && state.turn_in_flight
-                        && !matches!(state.turn_status, TurnStatus::Cancelling)
-                    {
-                        let sid = state.session_id.clone();
-                        let res = self.rpc.session_cancel(&sid).await;
-                        if let ChatPhase::Active(ref mut state) = self.phase {
-                            if res.is_ok() {
-                                state.enter_cancelling();
-                            } else {
-                                state.commit_turn(String::new(), false);
-                            }
-                        }
+                    if enq.is_ok() {
+                        self.cancel_active_turn_for_injection().await;
                     }
                     self.after_enqueue(enq);
                     return false;
                 }
                 InputBarAction::StatusMessage(msg) => {
-                    state.set_info_notice(msg);
+                    let cleanup_notice = state.input_bar.take_cleanup_report().notice();
+                    state.set_info_notice(append_cleanup_notice(msg, cleanup_notice));
                     return false;
                 }
                 InputBarAction::ToggleThinking => {
@@ -1421,8 +1601,19 @@ impl Chat {
                     state.mark_dirty_append();
                     return false;
                 }
+                InputBarAction::EnterBrowseMode => {
+                    state.enter_browse_mode();
+                    return false;
+                }
+                InputBarAction::OpenHelp => {
+                    self.help_requested = true;
+                    return false;
+                }
                 InputBarAction::ClearQueue(idx) => {
-                    let notice = state.clear_queue_cmd(idx);
+                    let notice = append_cleanup_notice(
+                        state.clear_queue_cmd(idx),
+                        state.input_bar.take_cleanup_report().notice(),
+                    );
                     state.set_info_notice(notice);
                     return false;
                 }
@@ -1480,7 +1671,12 @@ impl Chat {
                     Self::open_provider_picker(&rpc, state).await;
                     return false;
                 }
-                InputBarAction::Consumed => return false,
+                InputBarAction::Consumed => {
+                    if let Some(message) = state.input_bar.take_cleanup_report().notice() {
+                        state.set_info_notice(message);
+                    }
+                    return false;
+                }
                 InputBarAction::NotHandled => { /* fall through to chat-specific keys */ }
             }
         }
@@ -1703,18 +1899,6 @@ impl Chat {
             {
                 state.browse_move_down(1, false);
             }
-            Some(ChatTabAction::CopySelection) if state.has_selection() => {
-                let text = state.yank_selection();
-                if !text.is_empty() {
-                    crate::mouse::copy_osc52(&text);
-                }
-            }
-            Some(ChatTabAction::CopyAllVisible) if state.has_selection() => {
-                let text = state.yank_selection();
-                if !text.is_empty() {
-                    crate::mouse::copy_osc52(&text);
-                }
-            }
             _ => {}
         }
         false
@@ -1803,15 +1987,18 @@ impl Chat {
 
         let _ = rpc.session_close(&state.session_id).await;
         state.session_overlay = SessionOverlay::None;
-        state.reset_for_session(new_sid.clone(), new_name);
+        let current = state.todo_tracker.settings();
+        state.reset_for_session(
+            new_sid.clone(),
+            new_name,
+            Self::resolve_todo_settings(current),
+        );
         state.agent_alias = agent_alias.clone();
-        if pane_kind == PaneKind::Acp {
-            state.cwd = rehydrated.workspace_dir;
-        }
+        state.cwd = rehydrated.workspace_dir;
 
         Self::refresh_model_identity(rpc, state).await;
         if let Ok(msgs) = rpc.session_messages(&new_sid).await {
-            state.load_history(msgs.messages);
+            state.load_history(msgs.messages, pane_kind == PaneKind::Acp);
         }
     }
 
@@ -2180,8 +2367,11 @@ impl Chat {
             && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
             && !state.turn_in_flight
             && !state.input_bar.has_file_explorer()
+            && !state.input_bar.has_attachment_manager()
             && matches!(state.session_overlay, SessionOverlay::None)
             && !state.model_picker.is_open()
+            && state.pending_approval().is_none()
+            && state.pending_elicitation().is_none()
             && state.title_hit_target_at(mouse.column, mouse.row) == Some(TitleHitTarget::Agent)
         {
             let current_alias = state.agent_alias.clone();
@@ -2190,10 +2380,15 @@ impl Chat {
         }
 
         if let ChatPhase::Active(ref mut state) = self.phase {
-            // Let the file explorer handle mouse events first when open.
-            if state.input_bar.handle_mouse(mouse) {
-                state.clear_mouse_highlight();
-                return;
+            // The file explorer renders above every parent overlay.
+            if state.input_bar.has_file_explorer() {
+                let consumed = state.input_bar.handle_mouse(mouse);
+                let cleanup_report = state.input_bar.take_cleanup_report();
+                state.surface_cleanup_report(cleanup_report);
+                if consumed {
+                    state.clear_mouse_highlight();
+                    return;
+                }
             }
 
             if state.model_picker.is_open() {
@@ -2249,6 +2444,45 @@ impl Chat {
                 return;
             }
 
+            // Approval and elicitation overlays are keyboard-driven but still
+            // block clicks from reaching controls rendered beneath them.
+            if state.pending_approval().is_some() || state.pending_elicitation().is_some() {
+                return;
+            }
+
+            if state.context_menu.is_some() {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let request = if state.context_menu_select_at(mouse.column, mouse.row) {
+                            state.take_context_menu_request()
+                        } else {
+                            state.dismiss_context_menu();
+                            None
+                        };
+                        if let Some(request) = request {
+                            self.execute_context_menu_request(request).await;
+                        }
+                        return;
+                    }
+                    MouseEventKind::Down(MouseButton::Right)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown => {
+                        state.dismiss_context_menu();
+                    }
+                    MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left) => return,
+                    _ => {}
+                }
+            }
+
+            let input_bar_consumed = state.input_bar.handle_mouse(mouse);
+            let cleanup_report = state.input_bar.take_cleanup_report();
+            state.surface_cleanup_report(cleanup_report);
+            if input_bar_consumed {
+                state.clear_mouse_highlight();
+                return;
+            }
+
             use crossterm::event::KeyModifiers as KM;
             let col = mouse.column;
             let row = mouse.row;
@@ -2276,6 +2510,15 @@ impl Chat {
             // conversation handler, so clicks select queued items and the wheel
             // scrolls the queue rather than the transcript.
             if state.queue_sidebar_open() && state.point_in_queue_sidebar(col, row) {
+                let opens_context_menu =
+                    matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                        || (cfg!(target_os = "macos")
+                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            && mouse.modifiers.contains(KM::CONTROL));
+                if opens_context_menu {
+                    state.open_queue_context_menu(col, row);
+                    return;
+                }
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.queue_scroll_by(-3),
                     MouseEventKind::ScrollDown => state.queue_scroll_by(3),
@@ -2287,13 +2530,15 @@ impl Chat {
                 return;
             }
 
+            // The scrollbar is shared by browse mode and character-level
+            // transcript selection, so handle its drag lifecycle before those
+            // interaction modes diverge.
             match mouse.kind {
-                MouseEventKind::ScrollUp => state.scroll_up(3),
-                MouseEventKind::ScrollDown => state.scroll_down(3),
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(track) = state.scrollbar_track_rect
                         && mouse::in_rect(col, row, track)
                     {
+                        state.clear_transcript_selection();
                         state.scrollbar_drag = Some(ScrollbarDrag {
                             start_scroll: state.scroll_offset,
                             start_row: row,
@@ -2309,81 +2554,10 @@ impl Chat {
                         }
                         return;
                     }
-                    if let Some(text) = state
-                        .copy_hit_regions
-                        .iter()
-                        .find(|r| mouse::in_rect(col, row, r.rect))
-                        .map(|r| r.text.clone())
-                    {
-                        if !text.is_empty() {
-                            crate::mouse::copy_osc52(&text);
-                            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-                        }
-                        return;
-                    }
-                    let hit = state
-                        .entry_rects
-                        .iter()
-                        .find(|(_, r)| mouse::in_rect(col, row, *r))
-                        .map(|(idx, _)| *idx);
-                    let shift = mouse.modifiers.contains(KM::SHIFT);
-                    let ctrl = mouse.modifiers.contains(KM::CONTROL);
-                    if let Some(idx) = hit {
-                        if ctrl {
-                            if state.in_browse_mode() {
-                                if !state.browse_multi.remove(&idx) {
-                                    state.browse_multi.insert(idx);
-                                }
-                                state.mark_dirty_full();
-                            } else {
-                                // Ctrl+click outside browse mode: copy silently
-                                state.browse_multi.clear();
-                                state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
-                                state.mark_dirty_full();
-                            }
-                        } else if shift {
-                            if state.in_browse_mode() {
-                                if state.browse_cursor.is_none() {
-                                    state.browse_cursor = Some(idx);
-                                }
-                                state.browse_anchor = state.browse_cursor;
-                                state.browse_cursor = Some(idx);
-                                state.mark_dirty_full();
-                            } else {
-                                // Shift+click outside browse mode: copy silently
-                                state.browse_multi.clear();
-                                state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
-                                state.mark_dirty_full();
-                            }
-                        } else {
-                            // Plain click
-                            state.browse_multi.clear();
-                            state.browse_anchor = None;
-                            state.mark_dirty_full();
-
-                            if state.in_browse_mode() {
-                                // In browse mode: move cursor, prepare for drag/up copy
-                                state.browse_cursor = Some(idx);
-                                state.mouse_down_entry = Some(idx);
-                            } else {
-                                // Out of browse mode: copy silently, brief highlight
-                                state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
-                            }
-                        }
-                    } else {
-                        state.browse_multi.clear();
-                        state.browse_cursor = None;
-                        state.highlighted_entry = None;
-                        state.mouse_down_entry = None;
-                        state.browse_anchor = None;
-                        state.mark_dirty_full();
-                    }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let Some(drag) = state.scrollbar_drag {
+                        state.clear_transcript_selection();
                         let max = state
                             .last_total_rows
                             .saturating_sub(state.last_inner_height);
@@ -2398,7 +2572,135 @@ impl Chat {
                             (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
                         state.scroll_offset = new_off as u16;
                         state.pinned_to_bottom = state.scroll_offset >= max;
-                    } else if let Some(start) = state.mouse_down_entry {
+                        return;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) if state.scrollbar_drag.is_some() => {
+                    state.scrollbar_drag = None;
+                    return;
+                }
+                _ => {}
+            }
+
+            let opens_context_menu = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                || (cfg!(target_os = "macos")
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && mouse.modifiers.contains(KM::CONTROL));
+            if opens_context_menu {
+                state.open_transcript_context_menu(col, row);
+                return;
+            }
+
+            if !state.in_browse_mode() {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => state.scroll_up(3),
+                    MouseEventKind::ScrollDown => state.scroll_down(3),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(region) = state
+                            .copy_hit_regions
+                            .iter()
+                            .find(|region| {
+                                matches!(region.kind, CopyHitKind::Code | CopyHitKind::Transcript)
+                                    && mouse::in_rect(col, row, region.rect)
+                            })
+                            .cloned()
+                        {
+                            if state.copy_text_and_clear_selection(&region.text) {
+                                match region.kind {
+                                    CopyHitKind::Code => {
+                                        state.set_copy_feedback(CopyFeedbackTarget::Code(
+                                            region.group,
+                                        ));
+                                    }
+                                    CopyHitKind::Transcript => {
+                                        state.set_overlay_copy_feedback(region.rect);
+                                    }
+                                    CopyHitKind::Message => {}
+                                }
+                            }
+                        } else if (mouse.modifiers.contains(KM::SHIFT)
+                            || mouse.modifiers.contains(KM::ALT))
+                            && state.transcript_selection.is_some()
+                        {
+                            state.update_transcript_drag(col, row);
+                        } else {
+                            state.clear_mouse_highlight();
+                            state.begin_transcript_drag(col, row);
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        state.update_transcript_drag(col, row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        state.finish_transcript_drag();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            match mouse.kind {
+                MouseEventKind::ScrollUp => state.scroll_up(3),
+                MouseEventKind::ScrollDown => state.scroll_down(3),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(region) = state
+                        .copy_hit_regions
+                        .iter()
+                        .find(|r| mouse::in_rect(col, row, r.rect))
+                        .cloned()
+                    {
+                        if state.copy_text_and_clear_selection(&region.text) {
+                            match region.kind {
+                                CopyHitKind::Code => {
+                                    state.set_copy_feedback(CopyFeedbackTarget::Code(region.group));
+                                }
+                                CopyHitKind::Message => {
+                                    state.set_overlay_copy_feedback(region.rect);
+                                }
+                                CopyHitKind::Transcript => {
+                                    state.set_overlay_copy_feedback(region.rect);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    let hit = state
+                        .entry_rects
+                        .iter()
+                        .find(|(_, r)| mouse::in_rect(col, row, *r))
+                        .map(|(idx, _)| *idx);
+                    let shift = mouse.modifiers.contains(KM::SHIFT);
+                    let ctrl = mouse.modifiers.contains(KM::CONTROL);
+                    if let Some(idx) = hit {
+                        if ctrl {
+                            if !state.browse_multi.remove(&idx) {
+                                state.browse_multi.insert(idx);
+                            }
+                            state.mark_dirty_full();
+                        } else if shift {
+                            if state.browse_cursor.is_none() {
+                                state.browse_cursor = Some(idx);
+                            }
+                            state.browse_anchor = state.browse_cursor;
+                            state.browse_cursor = Some(idx);
+                            state.mark_dirty_full();
+                        } else {
+                            // Plain click
+                            state.browse_multi.clear();
+                            state.browse_anchor = None;
+                            // In browse mode: move cursor and prepare for
+                            // optional drag-range selection. Copying still
+                            // requires the explicit keyboard or button action.
+                            state.browse_cursor = Some(idx);
+                            state.mouse_down_entry = Some(idx);
+                            state.mark_dirty_full();
+                        }
+                    } else {
+                        state.clear_browse_selection();
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(start) = state.mouse_down_entry {
                         // Drag extends selection only in browse mode.
                         if state.in_browse_mode() {
                             let hit = state
@@ -2415,27 +2717,12 @@ impl Chat {
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    state.scrollbar_drag = None;
-                    // Auto-copy on mouse-up based on gesture:
-                    //   * Click (no drag) → copy the single entry.
-                    //   * Drag (range set) → copy the selection.
-                    if let Some(idx) = state.mouse_down_entry.take() {
-                        if state.browse_anchor.is_some() {
-                            // Drag → copy the range
-                            let text = state.yank_selection();
-                            if !text.is_empty() {
-                                crate::mouse::copy_osc52(&text);
-                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-                            }
-                        } else {
-                            // Plain click → copy the single entry
-                            let text = state.yank_single_entry(idx);
-                            if !text.is_empty() {
-                                crate::mouse::copy_osc52(&text);
-                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-                            }
-                        }
-                    }
+                    // Mouse-up ends a browse-mode drag gesture only. It must
+                    // not copy implicitly: users expect dragging transcript
+                    // text to be safe while selecting words/lines in the
+                    // terminal, and whole-message copy now lives behind the
+                    // explicit `[Copy]` affordance.
+                    state.mouse_down_entry = None;
                 }
                 _ => {}
             }
@@ -2447,12 +2734,19 @@ impl Chat {
         let ChatPhase::Active(state) = &mut self.phase else {
             return;
         };
-        if state.turn_in_flight {
+        // Bracketed paste bypasses the keyboard handlers that give modal and
+        // browse surfaces first refusal. Consult the same composer-ownership
+        // decision before routing it into the input bar so neither text nor a
+        // path-like attachment can mutate hidden state.
+        if !state.composer_owns_text_input() {
             return;
         }
         let action = state.input_bar.handle_paste(text);
         if let InputBarAction::StatusMessage(msg) = action {
-            state.set_info_notice(msg);
+            let cleanup_notice = state.input_bar.take_cleanup_report().notice();
+            state.set_info_notice(append_cleanup_notice(msg, cleanup_notice));
+        } else if let Some(message) = state.input_bar.take_cleanup_report().notice() {
+            state.set_info_notice(message);
         }
     }
 
@@ -2474,12 +2768,20 @@ impl Chat {
         }
     }
 
+    /// Working directory for the active conversation, if a session is running.
+    pub(crate) fn current_cwd(&self) -> Option<&str> {
+        match &self.phase {
+            ChatPhase::Active(s) => s.cwd.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Active info-bar message for the app-level `InfoBar`, expiring it first if
     /// it has outlived [`crate::widgets::INFO_BAR_TTL`] so the bar auto-hides.
     pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
         if let ChatPhase::Active(s) = &mut self.phase {
             if s.info_message.as_ref().is_some_and(|m| m.is_expired()) {
-                s.info_message = None;
+                s.clear_info_notice();
             }
             return s.info_message.as_ref();
         }
@@ -2505,6 +2807,8 @@ impl Chat {
     pub(crate) fn clear_input(&mut self) {
         if let ChatPhase::Active(s) = &mut self.phase {
             s.input_bar.reset();
+            let cleanup_report = s.input_bar.take_cleanup_report();
+            s.surface_cleanup_report(cleanup_report);
             s.mark_dirty_full();
         }
     }
@@ -2516,6 +2820,10 @@ impl Chat {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn take_help_request(&mut self) -> bool {
+        std::mem::take(&mut self.help_requested)
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
@@ -2535,12 +2843,29 @@ impl Chat {
                 if !matches!(s.session_overlay, SessionOverlay::None) {
                     return false;
                 }
+                if s.pending_approval().is_some() {
+                    return false;
+                }
                 // Browse mode: single-char bindings active.
                 if s.in_browse_mode() {
                     return false;
                 }
                 // Command mode when input is empty; text mode when typing.
                 s.input_bar.wants_text_input()
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        match &self.phase {
+            ChatPhase::Active(state) => {
+                !state.model_picker.is_open()
+                    && state.pending_elicitation().is_none()
+                    && state.pending_approval().is_none()
+                    && matches!(state.session_overlay, SessionOverlay::None)
+                    && !state.in_browse_mode()
+                    && state.input_bar.claims_pane_navigation(key)
             }
             _ => false,
         }
@@ -2701,7 +3026,9 @@ impl crate::widgets::HelpContext for Chat {
                             crate::i18n::t("zc-chat-help-extend-selection"),
                         ),
                         E::new(
-                            action_key_labels(C::CopySelection),
+                            action_key_labels(C::CopySelection)
+                                .into_iter()
+                                .chain(action_key_labels(C::CopyAllVisible)),
                             crate::i18n::t("zc-chat-help-yank-selection"),
                         ),
                         E::new(return_keys, crate::i18n::t("zc-chat-help-return-to-input")),
@@ -2931,7 +3258,7 @@ fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (R
     }
 }
 
-fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
+fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind) {
     // Carve the TodoWrite tracker's area first (outermost split), so the
     // rest of the pane (queue sidebar, transcript, input) lays out in the
     // remaining body. When the tracker wants no space, `body == area` and
@@ -2987,7 +3314,9 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // Optional CWD line just above the input bar (bottom of conv_area).
     // Renders `<cwd> - (branch) (hash)`, all left-aligned; the branch and hash
     // segments are appended only when the daemon's git poll has resolved them.
-    let actual_conv = if let Some(ref cwd) = state.cwd {
+    let actual_conv = if pane_kind == PaneKind::Acp
+        && let Some(ref cwd) = state.cwd
+    {
         if conv_area.height > 1 {
             let cwd_row = Rect::new(
                 conv_area.x,
@@ -3026,6 +3355,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     render_conversation(f, state, actual_conv);
     state.input_bar.render_autocomplete_popup(f);
+    state.input_bar.render_attachment_manager(f, area);
 
     if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
@@ -3035,7 +3365,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
         render_elicitation_overlay(f, state, area);
     }
 
-    match &state.session_overlay {
+    match &mut state.session_overlay {
         SessionOverlay::List {
             sessions,
             list_state,
@@ -3127,6 +3457,14 @@ fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
             crate::i18n::t("zc-queue-help-nav"),
         ),
         E::key(
+            chord_label(A::QueueSendNow),
+            crate::i18n::t("zc-queue-help-inject"),
+        ),
+        E::key(
+            chord_label(A::QueueCopy),
+            crate::i18n::t("zc-chat-context-menu-copy"),
+        ),
+        E::key(
             chord_label(A::QueueDelete),
             crate::i18n::t("zc-queue-help-delete"),
         ),
@@ -3177,7 +3515,9 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(format!(" {title} "), theme::title_style()));
+        .border_style(theme::dim_style())
+        .title(Span::styled(format!(" {title} "), theme::title_style()))
+        .style(theme::fill_style());
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
@@ -3206,7 +3546,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
             let head_style = if selected {
                 theme::title_style()
             } else {
-                Style::default()
+                theme::body_style()
             };
             let preview = first_line_preview(&msg.text, inner.width.saturating_sub(4) as usize);
             let tag = if msg.status == QueueItemStatus::Injected {
@@ -3258,7 +3598,9 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // width hard-truncates. Wrapping made long messages spill onto extra rows
     // and pushed the queue out of alignment; the preview is already clipped to
     // the inner width above, and ratatui truncates anything still too wide.
-    let para = Paragraph::new(rows).scroll((scroll, 0));
+    let para = Paragraph::new(rows)
+        .style(theme::fill_style())
+        .scroll((scroll, 0));
     f.render_widget(para, inner);
 }
 
@@ -3503,6 +3845,82 @@ fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
     None
 }
 
+fn message_copy_label() -> String {
+    crate::i18n::t("zc-chat-copy-message")
+}
+
+fn message_copied_label() -> String {
+    crate::i18n::t("zc-chat-copy-message-copied")
+}
+
+#[cfg(test)]
+fn context_menu_copy_label() -> String {
+    crate::i18n::t("zc-chat-context-menu-copy")
+}
+
+fn context_menu_action_label(action: ChatContextMenuAction) -> String {
+    let key = match action {
+        ChatContextMenuAction::SendNow => "zc-chat-context-menu-send-now",
+        ChatContextMenuAction::Copy => "zc-chat-context-menu-copy",
+        ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
+        ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
+    };
+    crate::i18n::t(key)
+}
+
+fn should_copy_current_selection(state: &ChatState, key: &KeyEvent) -> bool {
+    use crate::keymap::ChatTabAction;
+
+    should_copy_action(state, key, ChatTabAction::from_chord(key))
+}
+
+fn should_copy_action(
+    state: &ChatState,
+    key: &KeyEvent,
+    action: Option<crate::keymap::ChatTabAction>,
+) -> bool {
+    use crate::keymap::ChatTabAction;
+
+    match action {
+        Some(action @ (ChatTabAction::CopySelection | ChatTabAction::CopyAllVisible)) => {
+            state.in_browse_mode()
+                || (state.transcript_selection.is_some()
+                    && crate::keymap::action_bypasses_text_input(action, key))
+        }
+        _ => false,
+    }
+}
+
+fn context_menu_rect(
+    column: u16,
+    row: u16,
+    bounds: Rect,
+    actions: &[ChatContextMenuAction],
+) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+
+    if bounds.width < 3 || bounds.height < 3 || actions.is_empty() {
+        return None;
+    }
+    let label_width = actions
+        .iter()
+        .map(|action| UnicodeWidthStr::width(context_menu_action_label(*action).as_str()) as u16)
+        .max()
+        .unwrap_or(0);
+    let width = (label_width + 4).min(bounds.width).max(3);
+    let height = (actions.len() as u16 + 2).min(bounds.height);
+    let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
+    let max_y = bounds
+        .y
+        .saturating_add(bounds.height.saturating_sub(height));
+    Some(Rect::new(
+        column.clamp(bounds.x, max_x),
+        row.clamp(bounds.y, max_y),
+        width,
+        height,
+    ))
+}
+
 /// Recover the fence language token from a code-fence header bar line. The
 /// header's first span is `┌─ lang ─────`; the ` code ` fallback label and an
 /// empty info string both yield `None` so the rebuilt fence stays unlabelled.
@@ -3525,13 +3943,6 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
-/// Wrapped screen-row count for a single cached line at the given width.
-fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
-    Paragraph::new(vec![borrow_line(line)])
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
-}
-
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
 fn copy_region(
     global_row: u16,
@@ -3540,6 +3951,7 @@ fn copy_region(
     scroll: u16,
     body: Rect,
     text: &str,
+    group: usize,
 ) -> Option<CopyHitRegion> {
     if global_row < scroll || global_row >= scroll + body.height {
         return None;
@@ -3547,24 +3959,71 @@ fn copy_region(
     Some(CopyHitRegion {
         rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
         text: text.to_string(),
+        kind: CopyHitKind::Code,
+        group,
     })
 }
 
-fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
-    let spans: Vec<Span<'a>> = line
-        .spans
-        .iter()
-        .map(|s| Span::styled(s.content.as_ref(), s.style))
-        .collect();
-    let mut out = Line::from(spans).style(line.style);
-    if let Some(a) = line.alignment {
-        out = out.alignment(a);
+fn code_context_region(
+    global_start: u16,
+    global_end: u16,
+    scroll: u16,
+    body: Rect,
+    text: &str,
+    group: usize,
+) -> Option<CopyHitRegion> {
+    let visible_start = global_start.max(scroll);
+    let visible_end = global_end.min(scroll.saturating_add(body.height));
+    if visible_end <= visible_start || text.is_empty() {
+        return None;
     }
-    out
+    Some(CopyHitRegion {
+        rect: Rect::new(
+            body.x,
+            body.y + visible_start.saturating_sub(scroll),
+            body.width,
+            visible_end - visible_start,
+        ),
+        text: text.to_string(),
+        kind: CopyHitKind::Code,
+        group,
+    })
+}
+
+fn centered_message_copy_rect(label: &str, anchor: Rect, body: Rect) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+
+    if anchor.height == 0 || body.height == 0 || body.width == 0 {
+        return None;
+    }
+    let cells = UnicodeWidthStr::width(label) as u16;
+    if cells == 0 || cells > body.width {
+        return None;
+    }
+    let row = anchor.y;
+    if row < body.y || row >= body.y.saturating_add(body.height) {
+        return None;
+    }
+
+    let x = body.x.saturating_add(body.width.saturating_sub(cells) / 2);
+    Some(Rect::new(x, row, cells, 1))
+}
+
+fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+
+    let cells = UnicodeWidthStr::width(label) as u16;
+    if cells == 0 || anchor.height == 0 {
+        return None;
+    }
+    let center = anchor.x.saturating_add(anchor.width / 2);
+    let x = center.saturating_sub(cells / 2);
+    Some(Rect::new(x, anchor.y, cells, 1))
 }
 
 fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.refresh_title_hit_rects(area);
+    state.expire_copy_feedback();
 
     // Width must be computed before cache rebuild — table column budgets
     // depend on it, and a width change invalidates cached layouts.
@@ -3639,6 +4098,11 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     } else {
         Vec::new()
     };
+    let transient_row_breaks = if transient {
+        row_breaks_for_lines(&transient_lines[state.cached_lines.len()..], inner_width)
+    } else {
+        Vec::new()
+    };
 
     let total_rows = if transient {
         Paragraph::new(transient_lines.clone())
@@ -3664,10 +4128,23 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.visible_line_slice(scroll, inner_height)
     };
 
+    let row_breaks = state
+        .cached_row_breaks
+        .iter()
+        .chain(&transient_row_breaks)
+        .copied()
+        .skip(usize::from(scroll))
+        .take(usize::from(body_area.height))
+        .chain(std::iter::repeat(TranscriptRowBreak::Hard))
+        .take(usize::from(body_area.height))
+        .collect();
+
     let p = Paragraph::new(render_lines)
         .wrap(Wrap { trim: false })
         .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
+    capture_transcript_snapshot(f, state, body_area, row_breaks);
+    render_transcript_selection(f, state);
 
     state.last_total_rows = total_rows;
     state.last_inner_height = inner_height;
@@ -3700,6 +4177,14 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
     state.rebuild_copy_regions(inner_width, scroll, body_rect);
+    if state.in_browse_mode() {
+        state.rebuild_message_copy_region(body_rect);
+    } else {
+        render_transcript_copy_overlay(f, state);
+    }
+    render_copy_feedback(f, state);
+    render_message_copy_overlay(f, state, body_rect);
+    render_context_menu(f, state);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -3721,6 +4206,143 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     } else {
         state.scrollbar_track_rect = None;
     }
+}
+
+fn capture_transcript_snapshot(
+    f: &mut Frame,
+    state: &mut ChatState,
+    body: Rect,
+    row_breaks: Vec<TranscriptRowBreak>,
+) {
+    state.set_transcript_snapshot(TranscriptSnapshot::capture(f, body, row_breaks));
+}
+
+fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
+    let (Some(snapshot), Some(selection)) =
+        (&state.transcript_snapshot, state.transcript_selection)
+    else {
+        return;
+    };
+    snapshot.render_selection(f, selection, theme::selected_bg_style());
+}
+
+fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
+    state
+        .copy_hit_regions
+        .retain(|region| region.kind != CopyHitKind::Transcript);
+
+    let Some(snapshot) = &state.transcript_snapshot else {
+        return;
+    };
+    let Some(selection) = state.transcript_selection else {
+        return;
+    };
+    let Some(text) = snapshot.selected_text(selection) else {
+        return;
+    };
+    let Some(anchor) = snapshot.selection_anchor_rect(selection) else {
+        return;
+    };
+    let label = message_copy_label();
+    let Some(rect) = centered_message_copy_rect(&label, anchor, snapshot.area) else {
+        return;
+    };
+
+    state.copy_hit_regions.push(CopyHitRegion {
+        rect,
+        text,
+        kind: CopyHitKind::Transcript,
+        group: 0,
+    });
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        rect,
+    );
+}
+
+fn render_message_copy_overlay(f: &mut Frame, state: &ChatState, body: Rect) {
+    let Some(region) = state.message_copy_region(body) else {
+        return;
+    };
+    f.render_widget(Clear, region.rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            message_copy_label(),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        region.rect,
+    );
+}
+
+fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
+    let Some(feedback) = state.copy_feedback else {
+        return;
+    };
+
+    match feedback.target {
+        CopyFeedbackTarget::Code(group) => {
+            let label = message_copied_label();
+            for region in state
+                .copy_hit_regions
+                .iter()
+                .filter(|region| region.kind == CopyHitKind::Code && region.group == group)
+            {
+                if let Some(rect) = centered_copy_feedback_rect(&label, region.rect) {
+                    render_copied_label(f, &label, rect);
+                }
+            }
+        }
+        CopyFeedbackTarget::Overlay(rect) => {
+            render_copied_label(f, &message_copied_label(), rect);
+        }
+    }
+}
+
+fn render_context_menu(f: &mut Frame, state: &ChatState) {
+    let Some(menu) = &state.context_menu else {
+        return;
+    };
+    f.render_widget(Clear, menu.rect);
+    let lines = menu
+        .target
+        .actions()
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let style = if index == menu.selected {
+                theme::accent_style().add_modifier(Modifier::BOLD)
+            } else {
+                theme::body_style()
+            };
+            Line::from(Span::styled(context_menu_action_label(*action), style))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::accent_style()),
+        ),
+        menu.rect,
+    );
+}
+
+fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label.to_string(),
+            theme::success_style().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        rect,
+    );
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -3936,7 +4558,7 @@ fn render_session_list_overlay(
     f: &mut Frame,
     area: Rect,
     sessions: &[SessionEntry],
-    list_state: &ListState,
+    list_state: &mut ListState,
     title: String,
 ) {
     let overlay_area = session_list_overlay_area(area);
@@ -3946,7 +4568,8 @@ fn render_session_list_overlay(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(title, theme::overlay_border_style()))
-        .style(theme::overlay_border_style());
+        .border_style(theme::overlay_border_style())
+        .style(theme::fill_style());
 
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
@@ -3962,9 +4585,11 @@ fn render_session_list_overlay(
         .collect();
 
     let list = List::new(items).highlight_style(theme::list_highlight_style());
-    // Copy state to pass as mutable.
-    let mut ls = *list_state;
-    f.render_stateful_widget(list, inner, &mut ls);
+    // Render through the caller's state so the scroll offset ratatui computes
+    // to keep the selection visible is retained. Mouse hit-testing later reads
+    // `list_state.offset()`, so a discarded offset would make clicks after a
+    // scroll resolve to the wrong row.
+    f.render_stateful_widget(list, inner, list_state);
 }
 
 fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
@@ -4634,12 +5259,109 @@ struct TitleHitRect {
     rect: Rect,
 }
 
-/// A clickable `[Copy]` label on a code-fence header bar. `text` is the exact
-/// fence contents; `rect` is the label's screen cells from the last draw.
-#[derive(Debug, Clone)]
+/// A clickable copy affordance from the last draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyHitKind {
+    Code,
+    Message,
+    Transcript,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CopyHitRegion {
     rect: Rect,
     text: String,
+    kind: CopyHitKind,
+    group: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatContextMenuAction {
+    SendNow,
+    Copy,
+    Edit,
+    Delete,
+}
+
+const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
+const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::SendNow,
+    ChatContextMenuAction::Copy,
+    ChatContextMenuAction::Edit,
+    ChatContextMenuAction::Delete,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatContextMenuTarget {
+    Transcript(CopyHitRegion),
+    Queue(u64),
+}
+
+impl ChatContextMenuTarget {
+    fn actions(&self) -> &'static [ChatContextMenuAction] {
+        match self {
+            Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
+            Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatContextMenu {
+    rect: Rect,
+    target: ChatContextMenuTarget,
+    selected: usize,
+}
+
+impl ChatContextMenu {
+    fn selected_action(&self) -> Option<ChatContextMenuAction> {
+        self.target.actions().get(self.selected).copied()
+    }
+
+    fn select_step(&mut self, delta: isize) {
+        let count = self.target.actions().len();
+        if count > 0 {
+            self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+        }
+    }
+
+    fn action_at(&self, column: u16, row: u16) -> Option<usize> {
+        if self.rect.width <= 2 || self.rect.height <= 2 {
+            return None;
+        }
+        let inner = Rect::new(
+            self.rect.x + 1,
+            self.rect.y + 1,
+            self.rect.width - 2,
+            self.rect.height - 2,
+        );
+        if !mouse::in_rect(column, row, inner) {
+            return None;
+        }
+        let index = usize::from(row.saturating_sub(inner.y));
+        (index < self.target.actions().len()).then_some(index)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatContextMenuRequest {
+    CopyTranscript(CopyHitRegion),
+    Queue {
+        id: u64,
+        action: ChatContextMenuAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyFeedbackTarget {
+    Code(usize),
+    Overlay(Rect),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyFeedback {
+    target: CopyFeedbackTarget,
+    shown_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4680,12 +5402,25 @@ pub struct ChatState {
     /// used to throttle re-fetches.
     pub git_branch_last_fetch: Option<Instant>,
     pub input_bar: InputBarState,
+    /// Attachments owned by the currently dispatched turn. Once an input-bar
+    /// submission leaves the composer, this is the sole owner until the turn
+    /// reaches a terminal outcome.
+    active_turn_attachments: Vec<PendingAttachment>,
     entries: Vec<ChatEntry>,
     streaming_text: String,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
+    /// Set when any streaming text was flushed during the current turn.
+    /// Used by `commit_turn` to decide whether `full_text` is a fallback
+    /// (no streaming happened) or a duplicate (streaming already committed).
+    turn_had_streaming_text: bool,
+    /// Set when any `ToolCall` event arrived during the current turn.
+    /// Used by `commit_turn` to distinguish "empty completion with tool
+    /// calls" (normal — tool output is the visible record) from "empty
+    /// completion with nothing at all" (needs a diagnostic row).
+    turn_had_tool_calls: bool,
     /// Fine-grained label for the input-bar title while a turn is active.
     /// Lockstep with `turn_in_flight` (`Idle` ↔ `false`) but adds the
     /// thinking / responding / tool-call breakdown for the UI.
@@ -4701,18 +5436,25 @@ pub struct ChatState {
     browse_anchor: Option<usize>,
     /// Ctrl+click multi-select set, independent of cursor/anchor range.
     browse_multi: std::collections::BTreeSet<usize>,
-    /// Click-selected entry for visual feedback without entering browse mode.
-    /// Set by mouse click, cleared on any key press. Separate from
-    /// `browse_cursor` so clicking doesn't steal keyboard input.
-    highlighted_entry: Option<usize>,
-    /// Entry index where mouse went down, reset on up.  Used to distinguish
-    /// a plain click (no Drag events → auto-copy single entry on Up) from a
-    /// drag gesture (Drag events occurred → auto-copy the range on Up).
+    /// Entry index where mouse went down while browse mode is active. Used
+    /// only to extend in-app range selection during a drag; mouse-up never
+    /// copies implicitly.
     mouse_down_entry: Option<usize>,
+    /// Visible transcript cells from the last draw. Character-level selection
+    /// uses this exact rendered grid so Markdown wrapping has one source of truth.
+    transcript_snapshot: Option<TranscriptSnapshot>,
+    /// Normal-mode character selection within `transcript_snapshot`.
+    transcript_selection: Option<TranscriptSelection>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
-    /// Clickable `[Copy]` code-fence labels from the last draw.
+    /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
+    /// Full code-block targets used by right-click context-menu resolution.
+    context_copy_regions: Vec<CopyHitRegion>,
+    /// Active transcript or queue context menu.
+    context_menu: Option<ChatContextMenu>,
+    /// Temporary `[Copied]` overlay for copy labels.
+    copy_feedback: Option<CopyFeedback>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
@@ -4726,6 +5468,8 @@ pub struct ChatState {
     last_inner_height: u16,
     /// Cached rendered lines from committed entries.
     cached_lines: Vec<Line<'static>>,
+    /// Source-derived separator before each wrapped screen row in `cached_lines`.
+    cached_row_breaks: Vec<TranscriptRowBreak>,
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
@@ -4786,10 +5530,20 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    #[cfg(test)]
     pub fn new(
         session_id: String,
         agent_alias: String,
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
+    ) -> Self {
+        Self::with_shared_commands(session_id, agent_alias, todo_settings, &[])
+    }
+
+    fn with_shared_commands(
+        session_id: String,
+        agent_alias: String,
+        todo_settings: crate::todo_tracker::TodoTrackerSettings,
+        commands: &[crate::wire::CommandDescriptor],
     ) -> Self {
         Self {
             session_id,
@@ -4802,23 +5556,30 @@ impl ChatState {
             first_message: None,
             git_hash: None,
             git_branch_last_fetch: None,
-            input_bar: InputBarState::new(),
+            input_bar: InputBarState::with_shared_commands(commands),
+            active_turn_attachments: Vec::new(),
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),
             pending_approval: None,
             pending_elicitation: None,
             turn_in_flight: false,
+            turn_had_streaming_text: false,
+            turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
             show_thoughts: true,
             browse_cursor: None,
             browse_anchor: None,
             browse_multi: std::collections::BTreeSet::new(),
-            highlighted_entry: None,
             mouse_down_entry: None,
+            transcript_snapshot: None,
+            transcript_selection: None,
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
+            context_copy_regions: Vec::new(),
+            context_menu: None,
+            copy_feedback: None,
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
@@ -4828,6 +5589,7 @@ impl ChatState {
             last_total_rows: 0,
             last_inner_height: 0,
             cached_lines: Vec::new(),
+            cached_row_breaks: Vec::new(),
             cached_line_ranges: Vec::new(),
             cached_screen_ranges: Vec::new(),
             dirty: LinesDirty::Full,
@@ -4860,14 +5622,142 @@ impl ChatState {
         // Full is sticky — don't downgrade.
     }
 
+    /// Whether text input currently belongs to the composer rather than a
+    /// modal, picker, explorer, or transcript-browse surface.
+    fn composer_owns_text_input(&self) -> bool {
+        !self.model_picker.is_open()
+            && self.pending_elicitation().is_none()
+            && self.pending_approval().is_none()
+            && matches!(self.session_overlay, SessionOverlay::None)
+            && self.context_menu.is_none()
+            && !self.input_bar.has_file_explorer()
+            && !self.input_bar.has_attachment_manager()
+            && !self.in_browse_mode()
+    }
+
+    /// Route a key to an input-bar-owned overlay and retain its user feedback.
+    /// Returns true only when that overlay consumed the key before pane-level
+    /// shortcuts get a chance to process it.
+    fn handle_input_bar_overlay_key(&mut self, key: KeyEvent) -> bool {
+        if self.pending_approval().is_some()
+            || (!self.input_bar.has_file_explorer() && !self.input_bar.has_attachment_manager())
+        {
+            return false;
+        }
+
+        self.clear_mouse_highlight();
+        let action = self.input_bar.handle_key(key);
+        let cleanup_notice = self.input_bar.take_cleanup_report().notice();
+        // Explorer confirmation can reject an attachment (for example a file
+        // over the size limit). Preserve that feedback instead of swallowing it.
+        if let InputBarAction::StatusMessage(message) = action {
+            self.set_info_notice(append_cleanup_notice(message, cleanup_notice));
+        } else if let Some(message) = cleanup_notice {
+            self.set_info_notice(message);
+        }
+        self.mark_dirty_full();
+        true
+    }
+
     fn mark_dirty_full(&mut self) {
         self.dirty = LinesDirty::Full;
     }
 
+    fn clear_transcript_selection(&mut self) {
+        self.transcript_selection = None;
+        self.copy_hit_regions.clear();
+        self.context_copy_regions.clear();
+        self.context_menu = None;
+        self.copy_feedback = None;
+    }
+
+    fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
+        let Some(snapshot) = &self.transcript_snapshot else {
+            return false;
+        };
+        let Some(point) = snapshot.point_at(column, row) else {
+            self.clear_transcript_selection();
+            return false;
+        };
+        if snapshot.row_text_bounds(point.row).is_none() {
+            self.clear_transcript_selection();
+            return false;
+        }
+
+        self.copy_feedback = None;
+        self.transcript_selection = Some(TranscriptSelection {
+            anchor: point,
+            head: point,
+            dragged: false,
+        });
+        true
+    }
+
+    fn update_transcript_drag(&mut self, column: u16, row: u16) -> bool {
+        let Some(anchor) = self.transcript_selection.map(|selection| selection.anchor) else {
+            return false;
+        };
+        let Some(head) = self
+            .transcript_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.point_at(column, row))
+        else {
+            return false;
+        };
+
+        self.transcript_selection = Some(TranscriptSelection {
+            anchor,
+            head,
+            dragged: head != anchor,
+        });
+        true
+    }
+
+    fn finish_transcript_drag(&mut self) {
+        if self
+            .transcript_selection
+            .is_some_and(|selection| !selection.dragged)
+        {
+            self.transcript_selection = None;
+        }
+    }
+
+    fn transcript_selected_text(&self) -> Option<String> {
+        self.transcript_snapshot
+            .as_ref()?
+            .selected_text(self.transcript_selection?)
+    }
+
+    fn set_transcript_snapshot(&mut self, snapshot: TranscriptSnapshot) {
+        if self
+            .transcript_snapshot
+            .as_ref()
+            .is_some_and(|current| current != &snapshot)
+        {
+            self.clear_transcript_selection();
+        }
+        self.transcript_snapshot = Some(snapshot);
+    }
+
     fn clear_mouse_highlight(&mut self) {
-        if self.highlighted_entry.is_some() || self.mouse_down_entry.is_some() {
-            self.highlighted_entry = None;
+        self.mouse_down_entry = None;
+        self.clear_transcript_selection();
+    }
+
+    fn clear_browse_selection(&mut self) {
+        let lines_changed = self.mouse_down_entry.is_some()
+            || self.browse_cursor.is_some()
+            || self.browse_anchor.is_some()
+            || !self.browse_multi.is_empty();
+        if lines_changed || self.context_menu.is_some() || self.copy_feedback.is_some() {
             self.mouse_down_entry = None;
+            self.browse_cursor = None;
+            self.browse_anchor = None;
+            self.browse_multi.clear();
+            self.context_menu = None;
+            self.copy_feedback = None;
+        }
+        if lines_changed {
             self.mark_dirty_full();
         }
     }
@@ -4879,27 +5769,180 @@ impl ChatState {
         self.browse_cursor.is_some()
     }
 
-    /// True when anything is selected — cursor, range, or multi.
-    fn has_selection(&self) -> bool {
-        self.browse_cursor.is_some() || !self.browse_multi.is_empty()
+    fn copy_current_selection(&mut self) -> bool {
+        let text = self.current_selection_text();
+        let feedback_anchor = self
+            .copy_hit_regions
+            .iter()
+            .find(|region| matches!(region.kind, CopyHitKind::Message | CopyHitKind::Transcript))
+            .map(|region| region.rect)
+            .or_else(|| {
+                self.transcript_snapshot
+                    .as_ref()?
+                    .selection_anchor_rect(self.transcript_selection?)
+            });
+        if !self.copy_text_and_clear_selection(&text) {
+            return false;
+        }
+        if let Some(anchor) = feedback_anchor {
+            self.set_overlay_copy_feedback(anchor);
+        }
+        true
     }
 
-    /// Yank a single entry's body text — used by the auto-copy-on-click
-    /// feature when the user clicks a chat entry.
+    fn copy_text_and_clear_selection(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        crate::mouse::copy_osc52(text);
+        self.clear_mouse_highlight();
+        self.clear_browse_selection();
+        self.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+        true
+    }
+
+    fn current_selection_text(&self) -> String {
+        if self.transcript_selection.is_some() {
+            return self.transcript_selected_text().unwrap_or_default();
+        }
+        self.yank_selection()
+    }
+
+    fn dismiss_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    fn open_transcript_context_menu(&mut self, column: u16, row: u16) -> bool {
+        let Some(bounds) = self
+            .transcript_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.area)
+        else {
+            return false;
+        };
+        if !mouse::in_rect(column, row, bounds) {
+            return false;
+        }
+
+        let selected_target = match self.transcript_selection {
+            Some(selection) => {
+                let Some(snapshot) = self.transcript_snapshot.as_ref() else {
+                    return false;
+                };
+                let Some(text) = snapshot.selected_text(selection) else {
+                    return false;
+                };
+                let Some(rect) = snapshot.selection_anchor_rect(selection) else {
+                    return false;
+                };
+                Some(CopyHitRegion {
+                    rect,
+                    text,
+                    kind: CopyHitKind::Transcript,
+                    group: 0,
+                })
+            }
+            None => None,
+        };
+
+        // Code blocks are nested inside message rows, so resolve their more
+        // specific target before falling back to the containing message.
+        let target = selected_target.or_else(|| {
+            self.context_copy_regions
+                .iter()
+                .find(|region| mouse::in_rect(column, row, region.rect))
+                .cloned()
+                .or_else(|| {
+                    self.entry_rects
+                        .iter()
+                        .find(|(_, rect)| row >= rect.y && row < rect.y.saturating_add(rect.height))
+                        .and_then(|(idx, rect)| {
+                            let text = self.yank_single_entry(*idx);
+                            (!text.is_empty()).then_some(CopyHitRegion {
+                                rect: *rect,
+                                text,
+                                kind: CopyHitKind::Message,
+                                group: *idx,
+                            })
+                        })
+                })
+        });
+        let Some(target) = target else {
+            return false;
+        };
+        let target = ChatContextMenuTarget::Transcript(target);
+        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+            return false;
+        };
+        self.context_menu = Some(ChatContextMenu {
+            rect,
+            target,
+            selected: 0,
+        });
+        true
+    }
+
+    fn open_queue_context_menu(&mut self, column: u16, row: u16) -> bool {
+        let id = self
+            .queue_item_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(id, _)| *id);
+        let (Some(id), Some(bounds)) = (id, self.queue_sidebar_rect) else {
+            return false;
+        };
+        self.select_queued_by_id(id);
+        let target = ChatContextMenuTarget::Queue(id);
+        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+            return false;
+        };
+        self.context_menu = Some(ChatContextMenu {
+            rect,
+            target,
+            selected: 0,
+        });
+        self.mark_dirty_full();
+        true
+    }
+
+    fn context_menu_select_step(&mut self, delta: isize) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.select_step(delta);
+            self.mark_dirty_full();
+        }
+    }
+
+    fn context_menu_select_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return false;
+        };
+        let Some(index) = menu.action_at(column, row) else {
+            return false;
+        };
+        menu.selected = index;
+        true
+    }
+
+    fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
+        let menu = self.context_menu.take()?;
+        let action = menu.selected_action()?;
+        match (menu.target, action) {
+            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
+                Some(ChatContextMenuRequest::CopyTranscript(target))
+            }
+            (ChatContextMenuTarget::Queue(id), action) => {
+                Some(ChatContextMenuRequest::Queue { id, action })
+            }
+            (ChatContextMenuTarget::Transcript(_), _) => None,
+        }
+    }
+
+    /// Yank a single entry's body text for explicit copy actions.
     fn yank_single_entry(&self, idx: usize) -> String {
         self.entries
             .get(idx)
             .map(clipboard_text)
             .unwrap_or_default()
-    }
-
-    /// Copy a single entry to clipboard silently (no browse mode, just OSC 52).
-    fn copy_entry_silently(state: &mut ChatState, idx: usize) {
-        let text = state.yank_single_entry(idx);
-        if !text.is_empty() {
-            crate::mouse::copy_osc52(&text);
-            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-        }
     }
 
     /// Build the clipboard string. Single = body. Multi = role-prefixed.
@@ -4925,6 +5968,7 @@ impl ChatState {
 
     /// Enter browse mode: jump cursor to last entry, clear anchor.
     fn enter_browse_mode(&mut self) {
+        self.clear_transcript_selection();
         if !self.entries.is_empty() {
             self.browse_cursor = Some(self.entries.len() - 1);
             self.browse_anchor = None;
@@ -4935,9 +5979,12 @@ impl ChatState {
     /// Leave browse mode: clear both cursor and anchor, return to input.
     fn exit_browse_mode(&mut self) {
         self.browse_cursor = None;
-        self.highlighted_entry = None;
         self.mouse_down_entry = None;
         self.browse_anchor = None;
+        self.copy_hit_regions.clear();
+        self.context_copy_regions.clear();
+        self.context_menu = None;
+        self.copy_feedback = None;
         self.mark_dirty_full();
     }
 
@@ -4955,8 +6002,9 @@ impl ChatState {
         } else if !extend {
             self.browse_anchor = None;
         }
-        self.browse_cursor = Some(cur.saturating_sub(n));
-        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        let next = cur.saturating_sub(n);
+        self.browse_cursor = Some(next);
+        self.scroll_entry_into_view(next);
         self.pinned_to_bottom = false;
         self.mark_dirty_full();
     }
@@ -4975,8 +6023,9 @@ impl ChatState {
         } else if !extend {
             self.browse_anchor = None;
         }
-        self.browse_cursor = Some((cur + n).min(len - 1));
-        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        let next = cur.saturating_add(n).min(len - 1);
+        self.browse_cursor = Some(next);
+        self.scroll_entry_into_view(next);
         self.pinned_to_bottom =
             self.scroll_offset >= self.last_total_rows.saturating_sub(self.last_inner_height);
         self.mark_dirty_full();
@@ -5021,8 +6070,7 @@ impl ChatState {
             .is_some_and(|(lo, hi)| idx >= lo && idx <= hi)
     }
 
-    /// True when `idx` should render highlighted: in range, in multi-select,
-    /// matches the lone cursor, or is the click-highlighted entry.
+    /// True when `idx` should render highlighted in browse mode.
     fn is_entry_highlighted(&self, idx: usize) -> bool {
         if self.browse_multi.contains(&idx) {
             return true;
@@ -5030,7 +6078,7 @@ impl ChatState {
         if self.is_in_browse_range(idx) {
             return true;
         }
-        self.browse_cursor == Some(idx) || self.highlighted_entry == Some(idx)
+        self.browse_cursor == Some(idx)
     }
 
     /// Total selection: multi-select set ∪ browse range ∪ lone cursor.
@@ -5086,6 +6134,8 @@ impl ChatState {
                 Paragraph::new(new_lines.iter().map(borrow_line).collect::<Vec<_>>())
                     .wrap(Wrap { trim: false })
                     .line_count(width) as u16;
+            self.cached_row_breaks
+                .extend(row_breaks_for_lines(&new_lines, width));
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
             self.cached_entry_count = total - start;
@@ -5114,6 +6164,7 @@ impl ChatState {
                 ranges.push((abs_idx, before, after));
             }
         }
+        self.cached_row_breaks = row_breaks_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
         self.cached_entry_count = total - start;
@@ -5212,20 +6263,43 @@ impl ChatState {
     fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
         let copy_lbl = " [Copy] ";
         let mut regions: Vec<CopyHitRegion> = Vec::new();
+        let mut context_regions: Vec<CopyHitRegion> = Vec::new();
         let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
-        let mut pending: Option<(u16, u16, u16, Option<String>, String)> = None;
+        let mut pending: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
         for line in &lines {
             let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             if first.starts_with('\u{250c}') {
                 let lang = header_fence_lang(line);
-                pending = label_cells(line, copy_lbl)
-                    .map(|(col, cells)| (screen_cursor, col, cells, lang, String::new()));
+                pending = label_cells(line, copy_lbl).map(|(col, cells)| {
+                    (
+                        screen_cursor,
+                        col,
+                        cells,
+                        screen_cursor as usize,
+                        lang,
+                        String::new(),
+                    )
+                });
             } else if first.starts_with('\u{2514}') {
-                if let Some((header_row, header_col, header_cells, lang, acc)) = pending.take() {
+                if let Some((header_row, header_col, header_cells, group, lang, acc)) =
+                    pending.take()
+                {
                     let text = fenced_text(lang.as_deref(), &acc);
-                    if let Some(r) =
-                        copy_region(header_row, header_col, header_cells, scroll, body, &text)
+                    let block_end = screen_cursor.saturating_add(wrapped_rows(line, width));
+                    if let Some(region) =
+                        code_context_region(header_row, block_end, scroll, body, &text, group)
                     {
+                        context_regions.push(region);
+                    }
+                    if let Some(r) = copy_region(
+                        header_row,
+                        header_col,
+                        header_cells,
+                        scroll,
+                        body,
+                        &text,
+                        group,
+                    ) {
                         regions.push(r);
                     }
                     if let Some((footer_col, footer_cells)) = label_cells(line, copy_lbl)
@@ -5236,12 +6310,13 @@ impl ChatState {
                             scroll,
                             body,
                             &text,
+                            group,
                         )
                     {
                         regions.push(r);
                     }
                 }
-            } else if let Some((_, _, _, _, acc)) = pending.as_mut() {
+            } else if let Some((_, _, _, _, _, acc)) = pending.as_mut() {
                 let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 let body_text = full.strip_prefix("  ").unwrap_or(&full).to_string();
                 if !acc.is_empty() {
@@ -5253,6 +6328,40 @@ impl ChatState {
             screen_cursor += wrapped_rows(line, width);
         }
         self.copy_hit_regions = regions;
+        self.context_copy_regions = context_regions;
+    }
+
+    fn message_copy_region(&self, body: Rect) -> Option<CopyHitRegion> {
+        let selected = self.selected_entries();
+        let idx = if selected.len() == 1 {
+            *selected.iter().next()?
+        } else {
+            return None;
+        };
+        let (_, rect) = self
+            .entry_rects
+            .iter()
+            .find(|(entry_idx, _)| *entry_idx == idx)?;
+        if rect.height == 0 {
+            return None;
+        }
+        let text = self.yank_single_entry(idx);
+        if text.is_empty() {
+            return None;
+        }
+        let label = message_copy_label();
+        Some(CopyHitRegion {
+            rect: centered_message_copy_rect(&label, *rect, body)?,
+            text,
+            kind: CopyHitKind::Message,
+            group: idx,
+        })
+    }
+
+    fn rebuild_message_copy_region(&mut self, body: Rect) {
+        if let Some(region) = self.message_copy_region(body) {
+            self.copy_hit_regions.push(region);
+        }
     }
 
     fn compute_cached_rows(&self, width: u16) -> u16 {
@@ -5267,11 +6376,13 @@ impl ChatState {
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
+        self.clear_transcript_selection();
         self.pinned_to_bottom = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
+        self.clear_transcript_selection();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
         if self.scroll_offset >= max {
@@ -5288,11 +6399,13 @@ impl ChatState {
     }
 
     pub fn scroll_to_top(&mut self) {
+        self.clear_transcript_selection();
         self.pinned_to_bottom = false;
         self.scroll_offset = 0;
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.clear_transcript_selection();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = max;
         self.pinned_to_bottom = true;
@@ -5417,12 +6530,16 @@ impl ChatState {
     /// Commit any accumulated streaming text as an `AgentMessage` entry.
     /// Called when a tool call interrupts the text stream so that pre-tool
     /// text is committed in conversation order before the `Tool` entry.
-    fn flush_streaming_text(&mut self) {
+    /// Returns `true` if any text was flushed.
+    fn flush_streaming_text(&mut self) -> bool {
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
             self.entries
                 .push(ChatEntry::AgentMessage(Arc::<str>::from(text)));
             self.mark_dirty_append();
+            true
+        } else {
+            false
         }
     }
 
@@ -5435,6 +6552,7 @@ impl ChatState {
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
+            | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
             | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
         };
@@ -5473,8 +6591,11 @@ impl ChatState {
                 // Flush any accumulated text and thought before the tool call
                 // so that pre-tool agent text and thinking both appear in
                 // conversation order before the Tool entry.
-                self.flush_streaming_text();
+                if self.flush_streaming_text() {
+                    self.turn_had_streaming_text = true;
+                }
                 self.flush_streaming_thought();
+                self.turn_had_tool_calls = true;
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::CallingTool(name.clone());
                 }
@@ -5548,6 +6669,22 @@ impl ChatState {
                     self.context_max_tokens = max_context_tokens;
                 }
             }
+            SessionUpdate::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason,
+                ..
+            } => {
+                let dropped = dropped_messages.to_string();
+                let kept = kept_turns.to_string();
+                let notice = crate::i18n::t_args(
+                    "zc-chat-history-trimmed",
+                    &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
+                );
+                self.entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                self.mark_dirty_append();
+            }
             SessionUpdate::TurnComplete {
                 outcome, content, ..
             } => match outcome {
@@ -5571,14 +6708,40 @@ impl ChatState {
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
-        self.flush_streaming_text();
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
         self.flush_streaming_thought();
-        let _ = full_text;
+        // If no streaming text was accumulated during this turn, use the
+        // daemon-provided final text as a fallback so the turn is never
+        // invisible to the user.
+        if !self.turn_had_streaming_text && !full_text.is_empty() {
+            self.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(full_text)));
+            self.mark_dirty_append();
+        } else if clean
+            && !self.turn_had_streaming_text
+            && !self.turn_had_tool_calls
+            && full_text.is_empty()
+        {
+            // Clean completion with no streamed text, no tool calls, and
+            // no final content — render a diagnostic so the user knows the
+            // turn finished rather than silently vanishing.
+            self.entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                    "zc-turn-no-output",
+                ))));
+            self.mark_dirty_append();
+        }
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
         self.mark_dirty_append();
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
-        self.input_bar.cleanup_temps();
+        let mut cleanup_report = self.cleanup_active_turn_attachments();
+        cleanup_report.merge(self.input_bar.take_cleanup_report());
+        self.surface_cleanup_report(cleanup_report);
         if !clean && !self.resume_override && !self.message_queue.is_empty() {
             self.queue_paused = true;
         }
@@ -5610,10 +6773,21 @@ impl ChatState {
         });
         self.mark_dirty_append();
         self.turn_in_flight = true;
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
         // Start a fresh status + animation anchor. We're `Working` until the
         // first chunk (thought / message / tool-call) tells us otherwise.
         self.turn_status = TurnStatus::Working;
         self.turn_started_at = Instant::now();
+    }
+
+    fn own_active_turn_attachments(&mut self, attachments: Vec<PendingAttachment>) {
+        debug_assert!(self.active_turn_attachments.is_empty());
+        self.active_turn_attachments = attachments;
+    }
+
+    fn cleanup_active_turn_attachments(&mut self) -> CleanupReport {
+        cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
     }
 
     const QUEUE_CAP: usize = 32;
@@ -5634,10 +6808,14 @@ impl ChatState {
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
         if text.trim().is_empty() && attachments.is_empty() {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         let pending = self.message_queue.len();
         if pending >= Self::QUEUE_CAP {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
                 &[("cap", &Self::QUEUE_CAP.to_string())],
@@ -5659,9 +6837,13 @@ impl ChatState {
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
         if text.trim().is_empty() && attachments.is_empty() {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         if self.message_queue.len() >= Self::QUEUE_CAP {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
                 &[("cap", &Self::QUEUE_CAP.to_string())],
@@ -5749,13 +6931,39 @@ impl ChatState {
     /// and consistent rendering with model-switch notes.
     pub fn set_info_notice(&mut self, msg: String) {
         self.info_message = Some(crate::widgets::InfoMessage::note(msg));
-        self.mark_dirty_full();
+    }
+
+    fn surface_cleanup_report(&mut self, report: CleanupReport) {
+        if let Some(message) = report.notice() {
+            self.set_info_notice(message);
+        }
+    }
+
+    fn set_overlay_copy_feedback(&mut self, anchor: Rect) {
+        if let Some(rect) = centered_copy_feedback_rect(&message_copied_label(), anchor) {
+            self.set_copy_feedback(CopyFeedbackTarget::Overlay(rect));
+        }
+    }
+
+    fn set_copy_feedback(&mut self, target: CopyFeedbackTarget) {
+        self.copy_feedback = Some(CopyFeedback {
+            target,
+            shown_at: Instant::now(),
+        });
     }
 
     /// Drop the active info-bar message (on submit, inject, or turn start).
     pub fn clear_info_notice(&mut self) {
-        if self.info_message.take().is_some() {
-            self.mark_dirty_full();
+        self.info_message = None;
+        self.copy_feedback = None;
+    }
+
+    fn expire_copy_feedback(&mut self) {
+        let expired = self
+            .copy_feedback
+            .is_some_and(|feedback| feedback.shown_at.elapsed() >= COPY_FEEDBACK_TTL);
+        if expired {
+            self.copy_feedback = None;
         }
     }
 
@@ -5862,25 +7070,88 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    pub fn delete_selected_queued(&mut self) {
-        let Some(id) = self.queue_sel else { return };
-        if let Some(pos) = self.message_queue.iter().position(|m| m.id == id) {
-            if let Some(msg) = self.message_queue.remove(pos) {
-                cleanup_attachment_temps(&msg.attachments);
-            }
-            let ids = self.editable_ids();
-            self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
+    fn selected_queue_id(&self) -> Option<u64> {
+        self.queue_sel
+            .filter(|id| self.message_queue.iter().any(|message| message.id == *id))
+    }
+
+    fn queued_text(&self, id: u64) -> Option<String> {
+        self.message_queue
+            .iter()
+            .find(|message| message.id == id)
+            .map(|message| message.text.clone())
+    }
+
+    fn promote_queued_by_id(&mut self, id: u64) -> bool {
+        let Some(position) = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return false;
+        };
+        let pending = self.message_queue[position].status == QueueItemStatus::Pending;
+        if pending {
+            let Some(mut message) = self.message_queue.remove(position) else {
+                return false;
+            };
+            message.status = QueueItemStatus::Injected;
+            let insert_at = self
+                .message_queue
+                .iter()
+                .position(|queued| queued.status == QueueItemStatus::Pending)
+                .unwrap_or(self.message_queue.len());
+            self.message_queue.insert(insert_at, message);
+        }
+        let resumed = self.resume_queue();
+        if self.turn_in_flight {
+            self.resume_override = true;
+        }
+        if pending || resumed {
             self.mark_dirty_full();
+        }
+        true
+    }
+
+    fn delete_queued_by_id(&mut self, id: u64) -> bool {
+        let Some(position) = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return false;
+        };
+        if let Some(message) = self.message_queue.remove(position) {
+            let cleanup_report = cleanup_attachment_temps(&message.attachments);
+            self.surface_cleanup_report(cleanup_report);
+        }
+        let ids = self.editable_ids();
+        self.queue_sel = ids.get(position.min(ids.len().saturating_sub(1))).copied();
+        self.mark_dirty_full();
+        true
+    }
+
+    #[cfg(test)]
+    pub fn delete_selected_queued(&mut self) {
+        if let Some(id) = self.selected_queue_id() {
+            self.delete_queued_by_id(id);
         }
     }
 
-    pub fn take_selected_for_edit(&mut self) -> Option<(String, Vec<PendingAttachment>)> {
-        let id = self.queue_sel?;
-        let pos = self.message_queue.iter().position(|m| m.id == id)?;
-        let msg = self.message_queue.remove(pos)?;
+    fn take_queued_for_edit(&mut self, id: u64) -> Option<(String, Vec<PendingAttachment>)> {
+        let position = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)?;
+        let message = self.message_queue.remove(position)?;
         self.queue_sel = self.editable_ids().first().copied();
         self.mark_dirty_full();
-        Some((msg.text, msg.attachments))
+        Some((message.text, message.attachments))
+    }
+
+    #[cfg(test)]
+    pub fn take_selected_for_edit(&mut self) -> Option<(String, Vec<PendingAttachment>)> {
+        self.take_queued_for_edit(self.selected_queue_id()?)
     }
 
     /// Slash-command queue removal. `None` clears the whole queue; `Some(n)`
@@ -5894,9 +7165,12 @@ impl ChatState {
                 if count == 0 {
                     return crate::i18n::t("zc-queue-clear-empty");
                 }
-                self.clear_queue();
+                let cleanup_report = self.clear_queue();
                 self.mark_dirty_full();
-                crate::i18n::t_args("zc-queue-cleared-all", &[("count", &count.to_string())])
+                append_cleanup_notice(
+                    crate::i18n::t_args("zc-queue-cleared-all", &[("count", &count.to_string())]),
+                    cleanup_report.notice(),
+                )
             }
             Some(n) => {
                 if count == 0 {
@@ -5909,35 +7183,50 @@ impl ChatState {
                     );
                 }
                 let pos = n - 1;
+                let mut cleanup_report = CleanupReport::default();
                 if let Some(msg) = self.message_queue.remove(pos) {
-                    cleanup_attachment_temps(&msg.attachments);
+                    cleanup_report = cleanup_attachment_temps(&msg.attachments);
                     if self.queue_sel == Some(msg.id) {
                         let ids = self.editable_ids();
                         self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
                     }
                 }
                 self.mark_dirty_full();
-                crate::i18n::t_args("zc-queue-cleared-one", &[("index", &n.to_string())])
+                append_cleanup_notice(
+                    crate::i18n::t_args("zc-queue-cleared-one", &[("index", &n.to_string())]),
+                    cleanup_report.notice(),
+                )
             }
         }
     }
 
-    fn clear_queue(&mut self) {
+    fn clear_queue(&mut self) -> CleanupReport {
+        let mut cleanup_report = CleanupReport::default();
         for msg in self.message_queue.drain(..) {
-            cleanup_attachment_temps(&msg.attachments);
+            cleanup_report.merge(cleanup_attachment_temps(&msg.attachments));
         }
         self.next_queue_id = 0;
         self.queue_paused = false;
         self.resume_override = false;
         self.queue_sel = None;
+        cleanup_report
     }
 
-    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
+    fn load_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) {
         for m in messages {
             match m.role() {
                 crate::client::MessageRole::User => {
-                    if self.first_message.is_none() {
-                        self.first_message = Some(m.content.clone());
+                    let display = if strip_runtime_enrichment {
+                        strip_enrichment_prefix(&m.content)
+                    } else {
+                        &m.content
+                    };
+                    if self.first_message.is_none() && !display.trim().is_empty() {
+                        self.first_message = Some(display.to_string());
                     }
                     self.entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
@@ -5954,16 +7243,33 @@ impl ChatState {
         self.mark_dirty_full();
     }
     /// Reset conversational state for a new or switched session.
-    pub fn reset_for_session(&mut self, session_id: String, name: Option<String>) {
+    /// Re-materialize this pane's state for a newly-entered session.
+    ///
+    /// `todo_settings` is resolved fresh by the caller at the transition
+    /// boundary so restart and saved-session switch pick up Config-pane edits,
+    /// exactly like a brand-new session does.
+    pub fn reset_for_session(
+        &mut self,
+        session_id: String,
+        name: Option<String>,
+        todo_settings: crate::todo_tracker::TodoTrackerSettings,
+    ) {
         self.session_id = session_id;
         self.session_name = name;
         self.model_provider_ref = None;
         self.model = None;
         self.input_bar.reset();
+        let mut cleanup_report = self.input_bar.take_cleanup_report();
         self.entries.clear();
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.cached_lines.clear();
+        self.cached_row_breaks.clear();
+        self.entry_rects.clear();
+        self.copy_hit_regions.clear();
+        self.context_copy_regions.clear();
+        self.context_menu = None;
+        self.copy_feedback = None;
         self.dirty = LinesDirty::Full;
         self.cached_entry_count = 0;
         self.cached_render_start = 0;
@@ -5975,8 +7281,9 @@ impl ChatState {
         self.cancel_started_at = None;
         self.browse_cursor = None;
         self.browse_anchor = None;
-        self.highlighted_entry = None;
         self.mouse_down_entry = None;
+        self.transcript_snapshot = None;
+        self.transcript_selection = None;
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
         self.git_branch = None;
@@ -5988,8 +7295,29 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
-        self.clear_queue();
+        // The TodoWrite plan is per-session; drop it (and its show/hide state)
+        // so a switched-to session doesn't inherit the previous plan's tasks.
+        // Rebuilding from freshly resolved settings also applies any Config-pane
+        // edit made since this pane's `ChatState` was constructed.
+        self.todo_tracker.reset_for_session(todo_settings);
+        cleanup_report.merge(self.cleanup_active_turn_attachments());
+        cleanup_report.merge(self.clear_queue());
+        self.surface_cleanup_report(cleanup_report);
     }
+}
+
+/// Strip the runtime's date/time enrichment prefix from an ACP-persisted user
+/// message. ACP stores the Agent's provider-visible history, while normal Chat
+/// sessions store raw prompts and must preserve an identical user-authored
+/// prefix. Content without the runtime envelope passes through unchanged.
+fn strip_enrichment_prefix(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    rest[bracket_end + 1..].trim_start()
 }
 
 /// Body-only clipboard text.
@@ -6095,12 +7423,1149 @@ pub async fn open_editor_for_content(content: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Async env-lock for `#[tokio::test]` cases that resolve config through
+    /// environment variables and hold the guard across await points. Serializes
+    /// on a dedicated async mutex and, internally, on the shared sync
+    /// `env_test_lock` so sync and async env tests never run concurrently.
+    /// Lives here (not in `test_support`) because only the bin target has async
+    /// env-dependent tests, so keeping it module-local avoids a lib-target
+    /// dead-code suppression.
+    async fn env_test_lock_async() -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        static ASYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let async_guard = ASYNC_LOCK.lock().await;
+        let sync_guard = crate::test_support::env_test_lock();
+        (async_guard, sync_guard)
+    }
+
     fn state() -> ChatState {
         ChatState::new(
             "sess-1".to_string(),
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    fn command_action_from_initialize(
+        response: serde_json::Value,
+        command: &str,
+    ) -> InputBarAction {
+        let commands = crate::client::parse_initialize_response(&response)
+            .expect("matching-version initialize response parses");
+        let mut state = ChatState::with_shared_commands(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            &commands.commands,
+        );
+        state.input_bar.insert_text(command);
+        state.input_bar.submit_current_input_for_test()
+    }
+
+    #[test]
+    fn old_daemon_without_command_catalogue_preserves_shared_actions() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION")
+        });
+
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/help"),
+            InputBarAction::OpenHelp
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/model"),
+            InputBarAction::OpenModelPicker
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/new"),
+            InputBarAction::RestartSession
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response, "/new-session"),
+            InputBarAction::RestartSession
+        ));
+    }
+
+    #[test]
+    fn present_empty_command_catalogue_remains_authoritative() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        });
+
+        for command in ["/help", "/model", "/new", "/new-session"] {
+            match command_action_from_initialize(response.clone(), command) {
+                InputBarAction::Submit { text, attachments } => {
+                    assert_eq!(text.as_deref(), Some(command));
+                    assert!(attachments.is_empty());
+                }
+                _ => panic!("present empty catalogue must submit {command} as ordinary input"),
+            }
+        }
+    }
+
+    fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
+        use unicode_width::UnicodeWidthChar;
+
+        let mut cells = Vec::with_capacity(usize::from(area.width) * usize::from(area.height));
+        for row in 0..area.height {
+            let mut column = 0;
+            for ch in rows
+                .get(usize::from(row))
+                .copied()
+                .unwrap_or_default()
+                .chars()
+            {
+                if column >= area.width {
+                    break;
+                }
+                let width = (ch.width().unwrap_or(0) as u16)
+                    .max(1)
+                    .min(area.width - column);
+                cells.push(TranscriptCell {
+                    symbol: ch.to_string(),
+                    span_start: column,
+                });
+                for _ in 1..width {
+                    cells.push(TranscriptCell {
+                        symbol: String::new(),
+                        span_start: column,
+                    });
+                }
+                column += width;
+            }
+            while column < area.width {
+                cells.push(TranscriptCell {
+                    symbol: " ".to_string(),
+                    span_start: column,
+                });
+                column += 1;
+            }
+        }
+        TranscriptSnapshot {
+            area,
+            cells,
+            row_breaks: vec![TranscriptRowBreak::Hard; usize::from(area.height)],
+        }
+    }
+
+    fn transcript_snapshot_with_row_breaks(
+        area: Rect,
+        rows: &[&str],
+        row_breaks: &[TranscriptRowBreak],
+    ) -> TranscriptSnapshot {
+        let mut snapshot = transcript_snapshot(area, rows);
+        snapshot.row_breaks = row_breaks.to_vec();
+        snapshot
+    }
+
+    #[test]
+    fn transcript_selection_extracts_visible_wrapped_text() {
+        let snapshot = transcript_snapshot(Rect::new(10, 5, 8, 2), &["alpha be", "ta gamma"]);
+        let forward = TranscriptSelection {
+            anchor: CellPoint { column: 6, row: 0 },
+            head: CellPoint { column: 1, row: 1 },
+            dragged: true,
+        };
+        let reverse = TranscriptSelection {
+            anchor: CellPoint { column: 1, row: 1 },
+            head: CellPoint { column: 6, row: 0 },
+            dragged: true,
+        };
+        let click = TranscriptSelection {
+            anchor: CellPoint { column: 6, row: 0 },
+            head: CellPoint { column: 6, row: 0 },
+            dragged: false,
+        };
+
+        assert_eq!(snapshot.selected_text(forward).as_deref(), Some("be\nta"));
+        assert_eq!(snapshot.selected_text(reverse).as_deref(), Some("be\nta"));
+        assert_eq!(snapshot.selected_text(click), None);
+    }
+
+    #[test]
+    fn copy_transcript_selection_rejoins_soft_wrapped_prose() {
+        let snapshot = transcript_snapshot_with_row_breaks(
+            Rect::new(0, 0, 12, 4),
+            &["The drain", "keeps going", "1. First", "item wraps"],
+            &[
+                TranscriptRowBreak::Hard,
+                TranscriptRowBreak::SoftSpace,
+                TranscriptRowBreak::Hard,
+                TranscriptRowBreak::SoftSpace,
+            ],
+        );
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 9, row: 3 },
+            dragged: true,
+        };
+
+        assert_eq!(
+            snapshot.selected_text(selection).as_deref(),
+            Some("The drain keeps going\n1. First item wraps")
+        );
+    }
+
+    #[test]
+    fn copy_transcript_selection_rejoins_split_long_tokens_without_spaces() {
+        let snapshot = transcript_snapshot_with_row_breaks(
+            Rect::new(0, 0, 8, 2),
+            &["abcdefgh", "ijkl"],
+            &[TranscriptRowBreak::Hard, TranscriptRowBreak::SoftConcat],
+        );
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 3, row: 1 },
+            dragged: true,
+        };
+
+        assert_eq!(
+            snapshot.selected_text(selection).as_deref(),
+            Some("abcdefghijkl")
+        );
+    }
+
+    #[test]
+    fn copy_transcript_selection_restores_space_after_full_width_prose_row() {
+        let snapshot = transcript_snapshot_with_row_breaks(
+            Rect::new(0, 0, 10, 2),
+            &["12345 6789", "abc"],
+            &[TranscriptRowBreak::Hard, TranscriptRowBreak::SoftSpace],
+        );
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 2, row: 1 },
+            dragged: true,
+        };
+
+        assert_eq!(
+            snapshot.selected_text(selection).as_deref(),
+            Some("12345 6789 abc")
+        );
+    }
+
+    #[test]
+    fn copy_row_breaks_distinguish_spaces_tokens_and_logical_lines() {
+        let lines = vec![Line::from("alpha beta"), Line::from("second")];
+
+        assert_eq!(
+            row_breaks_for_lines(&lines, 6),
+            vec![
+                TranscriptRowBreak::Hard,
+                TranscriptRowBreak::SoftSpace,
+                TranscriptRowBreak::Hard,
+            ]
+        );
+        assert_eq!(
+            row_breaks_for_line(&Line::from("abcdefghijkl"), 8),
+            vec![TranscriptRowBreak::Hard, TranscriptRowBreak::SoftConcat,]
+        );
+        assert_eq!(
+            row_breaks_for_line(&Line::from("abcdefgh ijkl"), 8),
+            vec![TranscriptRowBreak::Hard, TranscriptRowBreak::SoftSpace,]
+        );
+        assert_eq!(
+            row_breaks_for_line(&Line::from("界界界界界"), 8),
+            vec![TranscriptRowBreak::Hard, TranscriptRowBreak::SoftConcat,]
+        );
+        assert_eq!(
+            row_breaks_for_line(
+                &Line::from(vec![Span::raw("abcdefgh"), Span::raw(" ijkl")]),
+                8,
+            ),
+            vec![TranscriptRowBreak::Hard, TranscriptRowBreak::SoftSpace,]
+        );
+    }
+
+    #[test]
+    fn copy_rendered_selection_uses_source_derived_wrap_separators() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        fn selected_text(message: &str) -> String {
+            let mut state = state();
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(message)));
+            state.mark_dirty_full();
+
+            let area = Rect::new(0, 0, 10, 8);
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|frame| render_conversation(frame, &mut state, area))
+                .expect("draw conversation");
+
+            let snapshot = state
+                .transcript_snapshot
+                .as_ref()
+                .expect("render captures transcript cells");
+            let rows = snapshot
+                .cells
+                .chunks(usize::from(snapshot.area.width))
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(|cell| cell.symbol.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let start_row = rows
+                .iter()
+                .position(|row| row.starts_with("abcdefgh"))
+                .expect("first wrapped row") as u16;
+            let end_row = start_row + 1;
+            let end_column = snapshot
+                .row_text_bounds(end_row)
+                .expect("second wrapped row")
+                .1;
+            snapshot
+                .selected_text(TranscriptSelection {
+                    anchor: CellPoint {
+                        column: 0,
+                        row: start_row,
+                    },
+                    head: CellPoint {
+                        column: end_column,
+                        row: end_row,
+                    },
+                    dragged: true,
+                })
+                .expect("rendered selection text")
+        }
+
+        assert_eq!(selected_text("abcdefgh ijkl"), "abcdefgh ijkl");
+        assert_eq!(selected_text("abcdefghijkl"), "abcdefghijkl");
+        assert_eq!(
+            selected_text("abcdefgh\u{00a0}ijkl"),
+            "abcdefgh\u{00a0}ijkl"
+        );
+        assert_eq!(selected_text("abcdefgh\u{200b}ijkl"), "abcdefghijkl");
+    }
+
+    #[test]
+    fn copy_context_menu_is_clamped_to_conversation_bounds() {
+        use unicode_width::UnicodeWidthStr;
+
+        let bounds = Rect::new(10, 5, 20, 8);
+        let menu_width = (UnicodeWidthStr::width(context_menu_copy_label().as_str()) as u16 + 4)
+            .min(bounds.width)
+            .max(3);
+
+        assert_eq!(
+            context_menu_rect(29, 12, bounds, TRANSCRIPT_CONTEXT_ACTIONS),
+            Some(Rect::new(
+                bounds.x + bounds.width - menu_width,
+                bounds.y + bounds.height - 3,
+                menu_width,
+                3,
+            ))
+        );
+        assert_eq!(
+            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
+                .unwrap()
+                .x,
+            bounds.x
+        );
+        assert_eq!(
+            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
+                .unwrap()
+                .y,
+            bounds.y
+        );
+    }
+
+    #[test]
+    fn context_menu_targets_message_from_side_whitespace() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 30, 3), &["hello"]));
+        state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
+
+        assert!(state.open_transcript_context_menu(35, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Message);
+        assert_eq!(target.text, "hello");
+    }
+
+    #[test]
+    fn context_menu_prefers_active_selected_text_until_selection_is_cleared() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 10, 3), &["hello"]));
+        state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 1, row: 0 },
+            head: CellPoint { column: 3, row: 0 },
+            dragged: true,
+        });
+
+        assert!(state.open_transcript_context_menu(12, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Transcript);
+        assert_eq!(target.text, "ell");
+
+        state.dismiss_context_menu();
+        assert!(state.open_transcript_context_menu(10, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Transcript);
+        assert_eq!(target.text, "ell");
+
+        state.dismiss_context_menu();
+        state.clear_transcript_selection();
+        assert!(state.open_transcript_context_menu(10, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Message);
+        assert_eq!(target.text, "hello");
+    }
+
+    #[test]
+    fn empty_character_selection_never_falls_back_to_another_copy_target() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 10, 2),
+            &["hello", "   "],
+        ));
+        state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
+        state.browse_cursor = Some(0);
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 1 },
+            head: CellPoint { column: 2, row: 1 },
+            dragged: true,
+        });
+
+        assert!(state.current_selection_text().is_empty());
+        assert!(!state.open_transcript_context_menu(10, 5));
+        assert!(state.context_menu.is_none());
+    }
+
+    #[test]
+    fn context_menu_prefers_code_block_over_containing_message() {
+        let mut state = state();
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "before\n```sh\necho hi\n```\nafter",
+        )));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 40, 6),
+            &["before", "code", "echo hi", "", "after"],
+        ));
+        state.entry_rects.push((0, Rect::new(0, 0, 20, 5)));
+        state.context_copy_regions.push(CopyHitRegion {
+            rect: Rect::new(0, 1, 40, 3),
+            text: "echo hi".to_string(),
+            kind: CopyHitKind::Code,
+            group: 7,
+        });
+
+        assert!(state.open_transcript_context_menu(2, 2));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Code);
+        assert_eq!(target.text, "echo hi");
+        assert_eq!(target.group, 7);
+    }
+
+    #[test]
+    fn context_menu_dismissal_does_not_change_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 10, 3),
+            &["hello", "", ""],
+        ));
+        state.entry_rects.push((0, Rect::new(0, 0, 5, 1)));
+        state.browse_cursor = Some(0);
+        state.dirty = LinesDirty::Clean;
+
+        assert!(state.open_transcript_context_menu(1, 0));
+        assert_eq!(state.dirty, LinesDirty::Clean);
+        state.dismiss_context_menu();
+
+        assert!(state.context_menu.is_none());
+        assert_eq!(state.browse_cursor, Some(0));
+        assert!(state.info_message.is_none());
+        assert_eq!(state.copy_feedback, None);
+        assert_eq!(state.dirty, LinesDirty::Clean);
+    }
+
+    #[test]
+    fn context_menu_request_keeps_the_exact_transcript_target() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 10, 1), &["hello"]));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
+        state.browse_cursor = Some(0);
+        state.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 8, 3),
+            target: ChatContextMenuTarget::Transcript(CopyHitRegion {
+                rect: Rect::new(0, 0, 5, 1),
+                text: "hello".to_string(),
+                kind: CopyHitKind::Message,
+                group: 0,
+            }),
+            selected: 0,
+        });
+
+        let request = state.take_context_menu_request().expect("copy request");
+        assert!(state.context_menu.is_none());
+        assert!(matches!(
+            request,
+            ChatContextMenuRequest::CopyTranscript(CopyHitRegion {
+                kind: CopyHitKind::Message,
+                text,
+                ..
+            }) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn keyboard_copy_prefers_character_selection_then_browse_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.browse_cursor = Some(0);
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 12, 1),
+            &["visible text"],
+        ));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 6, row: 0 },
+            dragged: true,
+        });
+
+        assert_eq!(state.current_selection_text(), "visible");
+        state.clear_transcript_selection();
+        assert_eq!(state.current_selection_text(), "whole message");
+        state.browse_cursor = None;
+        assert!(state.current_selection_text().is_empty());
+    }
+
+    #[test]
+    fn keyboard_copy_clears_character_and_browse_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 12, 1),
+            &["visible text"],
+        ));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 6, row: 0 },
+            dragged: true,
+        });
+        state.dirty = LinesDirty::Clean;
+
+        assert!(state.copy_current_selection());
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.browse_cursor, None);
+        assert!(state.info_message.is_some());
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
+        ));
+        assert_eq!(state.dirty, LinesDirty::Clean);
+
+        state.browse_cursor = Some(0);
+        state.dirty = LinesDirty::Clean;
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(0, 0, 8, 1),
+            text: "whole message".to_string(),
+            kind: CopyHitKind::Message,
+            group: 0,
+        });
+        assert!(state.copy_current_selection());
+        assert_eq!(state.browse_cursor, None);
+        assert_eq!(state.dirty, LinesDirty::Full);
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn copy_shortcuts_do_not_swallow_normal_y_input() {
+        use crate::keymap::ChatTabAction;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut state = state();
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let command_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        let terminal_copy = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+        );
+        let bare_custom_copy_all = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+
+        assert!(!should_copy_current_selection(&state, &y));
+
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
+        assert!(!should_copy_current_selection(&state, &y));
+        assert!(should_copy_current_selection(&state, &command_c));
+        assert!(should_copy_current_selection(&state, &terminal_copy));
+        assert!(!should_copy_action(
+            &state,
+            &bare_custom_copy_all,
+            Some(ChatTabAction::CopyAllVisible),
+        ));
+
+        state.transcript_selection = None;
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.browse_cursor = Some(0);
+        assert!(should_copy_current_selection(&state, &y));
+    }
+
+    #[test]
+    fn transcript_selection_expands_wide_character_cells() {
+        let snapshot = transcript_snapshot(Rect::new(0, 0, 4, 1), &["A界B"]);
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 2, row: 0 },
+            head: CellPoint { column: 3, row: 0 },
+            dragged: true,
+        };
+
+        assert!(snapshot.has_text_at(CellPoint { column: 2, row: 0 }));
+        assert_eq!(
+            snapshot.selection_bounds(selection),
+            Some((
+                CellPoint { column: 1, row: 0 },
+                CellPoint { column: 3, row: 0 }
+            ))
+        );
+        assert_eq!(snapshot.selected_text(selection).as_deref(), Some("界B"));
+    }
+
+    #[test]
+    fn transcript_selection_drag_is_limited_to_conversation_body() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 8, 2),
+            &["alpha be", "ta gamma"],
+        ));
+
+        assert!(!state.begin_transcript_drag(2, 1));
+        assert_eq!(state.transcript_selection, None);
+
+        assert!(state.begin_transcript_drag(16, 5));
+        assert!(state.update_transcript_drag(11, 6));
+        state.finish_transcript_drag();
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("be\nta"));
+        assert_eq!(state.copy_feedback, None);
+        assert!(state.info_message.is_none());
+    }
+
+    #[test]
+    fn transcript_selection_drag_can_start_in_side_whitespace() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
+
+        assert!(state.begin_transcript_drag(17, 5));
+        assert!(state.update_transcript_drag(16, 5));
+        let snapshot = state.transcript_snapshot.as_ref().unwrap();
+        let selection = state.transcript_selection.unwrap();
+        assert_eq!(snapshot.selected_text(selection).as_deref(), Some("a"));
+        assert_eq!(
+            snapshot.selection_bounds(selection),
+            Some((
+                CellPoint { column: 4, row: 0 },
+                CellPoint { column: 4, row: 0 }
+            ))
+        );
+
+        assert!(state.update_transcript_drag(10, 5));
+        state.finish_transcript_drag();
+
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn transcript_selection_side_whitespace_click_still_dismisses() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
+
+        assert!(state.begin_transcript_drag(17, 5));
+        state.finish_transcript_drag();
+
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[test]
+    fn transcript_selection_empty_row_cannot_start_drag() {
+        let mut state = state();
+        state.transcript_snapshot =
+            Some(transcript_snapshot(Rect::new(10, 5, 8, 2), &["alpha", ""]));
+
+        assert!(!state.begin_transcript_drag(17, 6));
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[test]
+    fn transcript_selection_clears_on_scroll_and_session_reset() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.set_overlay_copy_feedback(Rect::new(0, 0, 5, 1));
+
+        state.scroll_up(1);
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.copy_feedback, None);
+        assert!(state.copy_hit_regions.is_empty());
+
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.scroll_to_top();
+        assert_eq!(state.transcript_selection, None);
+
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.last_total_rows = 10;
+        state.last_inner_height = 1;
+        state.scroll_to_bottom();
+        assert_eq!(state.transcript_selection, None);
+
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.enter_browse_mode();
+        assert_eq!(state.transcript_selection, None);
+
+        state.exit_browse_mode();
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        assert_eq!(state.transcript_selection, None);
+        assert!(state.transcript_snapshot.is_none());
+    }
+
+    #[test]
+    fn transcript_selection_clears_when_snapshot_changes() {
+        let replacements = [
+            (
+                "geometry",
+                transcript_snapshot(Rect::new(0, 0, 6, 1), &["hello "]),
+            ),
+            (
+                "content",
+                transcript_snapshot(Rect::new(0, 0, 5, 1), &["hullo"]),
+            ),
+        ];
+
+        for (case, replacement) in replacements {
+            let mut state = state();
+            state.transcript_snapshot =
+                Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+            assert!(state.begin_transcript_drag(0, 0));
+            assert!(state.update_transcript_drag(1, 0));
+            state.copy_hit_regions.push(CopyHitRegion {
+                rect: Rect::new(0, 0, 2, 1),
+                text: "he".to_string(),
+                kind: CopyHitKind::Transcript,
+                group: 0,
+            });
+            state.copy_feedback = Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(Rect::new(0, 0, 2, 1)),
+                shown_at: Instant::now(),
+            });
+
+            state.set_transcript_snapshot(replacement);
+
+            assert_eq!(state.transcript_selection, None, "{case} selection");
+            assert!(state.copy_hit_regions.is_empty(), "{case} copy regions");
+            assert_eq!(state.copy_feedback, None, "{case} copy feedback");
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_selection_rendered_drag_excludes_chrome() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello world")));
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+
+        let snapshot = state
+            .transcript_snapshot
+            .as_ref()
+            .expect("render captures transcript cells");
+        assert!(
+            snapshot.area.y > area.y,
+            "panel chrome stays outside snapshot"
+        );
+        let (text_row, text_col) = snapshot
+            .cells
+            .chunks(usize::from(snapshot.area.width))
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+                    .find("hello")
+                    .map(|column| (row as u16, column as u16))
+            })
+            .expect("rendered transcript contains message text");
+        let start_col = snapshot.area.x + text_col;
+        let start_row = snapshot.area.y + text_row;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        for event in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let column = if matches!(event, MouseEventKind::Down(_)) {
+                start_col
+            } else {
+                start_col + 4
+            };
+            chat.handle_mouse(
+                MouseEvent {
+                    kind: event,
+                    column,
+                    row: start_row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                area,
+            )
+            .await;
+        }
+
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("hello"));
+        assert!(!state.begin_transcript_drag(area.x, area.y));
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[tokio::test]
+    async fn transcript_selection_copy_action_is_explicit() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(1, 1, 20, 1),
+            &["hello               "],
+        ));
+        assert!(state.begin_transcript_drag(1, 1));
+        assert!(state.update_transcript_drag(2, 1));
+        state.finish_transcript_drag();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_transcript_copy_overlay(frame, &mut state))
+            .expect("draw copy action");
+        let region = state
+            .copy_hit_regions
+            .iter()
+            .find(|region| region.kind == CopyHitKind::Transcript)
+            .cloned()
+            .expect("selection exposes transcript copy action");
+        assert_eq!(region.text, "he");
+        assert_eq!(state.copy_feedback, None);
+
+        chat.phase = ChatPhase::Active(Box::new(state));
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: region.rect.x,
+                row: region.rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.transcript_selection, None);
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
+        ));
+        assert!(state.info_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn copy_shift_or_option_click_extends_character_selection_from_original_anchor() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 12, 2),
+            &["alpha beta", "gamma"],
+        ));
+        assert!(state.begin_transcript_drag(16, 5));
+        assert!(state.update_transcript_drag(19, 5));
+        state.finish_transcript_drag();
+
+        chat.phase = ChatPhase::Active(Box::new(state));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            chat.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: 21,
+                    row: 6,
+                    modifiers: KeyModifiers::ALT,
+                },
+                Rect::new(0, 0, 80, 20),
+            )
+            .await;
+        }
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.transcript_selection,
+            Some(TranscriptSelection {
+                anchor: CellPoint { column: 6, row: 0 },
+                head: CellPoint { column: 11, row: 1 },
+                dragged: true,
+            })
+        );
+        assert_eq!(
+            state.transcript_selected_text().as_deref(),
+            Some("beta\ngamma")
+        );
+
+        for (column, row, expected) in [
+            (
+                11,
+                5,
+                Some(TranscriptSelection {
+                    anchor: CellPoint { column: 6, row: 0 },
+                    head: CellPoint { column: 1, row: 0 },
+                    dragged: true,
+                }),
+            ),
+            (16, 5, None),
+        ] {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                chat.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::SHIFT,
+                    },
+                    Rect::new(0, 0, 80, 20),
+                )
+                .await;
+            }
+
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert_eq!(state.transcript_selection, expected);
+        }
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.transcript_selection,
+            Some(TranscriptSelection {
+                anchor: CellPoint { column: 0, row: 0 },
+                head: CellPoint { column: 0, row: 0 },
+                dragged: false,
+            })
+        );
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[tokio::test]
+    async fn copy_shift_click_keeps_browse_mode_message_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("first")));
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("second")));
+        state.browse_cursor = Some(0);
+        state.entry_rects = vec![(0, Rect::new(2, 3, 20, 1)), (1, Rect::new(2, 4, 20, 1))];
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.browse_anchor, Some(0));
+        assert_eq!(state.browse_cursor, Some(1));
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[tokio::test]
+    async fn scrollbar_drag_works_outside_browse_mode() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.last_total_rows = 100;
+        state.last_inner_height = 20;
+        state.scrollbar_track_rect = Some(Rect::new(79, 2, 1, 10));
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        for (kind, row) in [
+            (MouseEventKind::Down(MouseButton::Left), 4),
+            (MouseEventKind::Drag(MouseButton::Left), 8),
+        ] {
+            chat.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: 79,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 80, 20),
+            )
+            .await;
+        }
+
+        {
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert!(state.scrollbar_drag.is_some());
+            assert!(state.scroll_offset > 0);
+            assert_eq!(state.transcript_selection, None);
+        }
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 79,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.scrollbar_drag.is_none());
     }
 
     #[test]
@@ -6156,6 +8621,25 @@ mod tests {
             .unwrap_or_else(|_| panic!("{reason}"))
             .expect("RPC request channel should stay open");
         serde_json::from_str(&line).expect("RPC request should be JSON")
+    }
+
+    /// Answer every follow-up request a transition emits (session/close,
+    /// model identity refresh, history load) with a permissive empty result,
+    /// until the pane goes quiet. Keeps transition tests focused on the
+    /// behavior under test rather than on exact RPC choreography.
+    async fn drain_pending_requests(rx: &mut mpsc::Receiver<String>, rpc: &RpcOutbound) {
+        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        {
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("RPC request should be JSON");
+            if let Some(id) = request["id"].as_str() {
+                rpc.dispatch_response(
+                    id,
+                    Some(serde_json::json!({ "messages": [], "sessions": [] })),
+                    None,
+                );
+            }
+        }
     }
 
     fn respond_ok(rpc: &RpcOutbound, request: &serde_json::Value, result: serde_json::Value) {
@@ -6380,6 +8864,303 @@ mod tests {
         assert!(stage1.is_open());
     }
 
+    // ── Session-transition settings reload ──────────────────────────────────
+    //
+    // `zerocode-config.toml` is the single source of truth for TodoWrite
+    // display. A fresh session obviously reloads it, but restart and
+    // saved-session switch reuse the existing `ChatState`, so they must
+    // re-resolve the file too — otherwise a Config-pane edit silently fails to
+    // apply until zerocode is restarted. These drive the real transition
+    // helpers (`restart_session_for_state` / `switch_to_session_entry`), not a
+    // direct `reset_for_session` call.
+
+    struct ConfigDirGuard(Option<String>);
+    impl ConfigDirGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prev = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+            // SAFETY: these tests serialize on `config_dir_test_lock()`.
+            unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", dir) };
+            Self(prev)
+        }
+    }
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: these tests serialize on `config_dir_test_lock()`.
+            match &self.0 {
+                Some(v) => unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", v) },
+                None => unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") },
+            }
+        }
+    }
+
+    /// Write a `[todotracker]` section with a distinctive width/location.
+    fn write_tracker_config(dir: &std::path::Path, width: u16, enabled_at_start: bool) {
+        crate::config::persist_todotracker(
+            dir,
+            &crate::config::TodoTrackerSection {
+                enabled: true,
+                enabled_at_start,
+                location: crate::config::TodoTrackerLocation::Bottom,
+                width,
+                max_height: 7,
+            },
+        )
+        .expect("test config write should succeed");
+    }
+
+    #[tokio::test]
+    async fn restart_reloads_local_todo_settings() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        // Session starts with the tracker configured one way...
+        write_tracker_config(dir.path(), 30, false);
+        let mut state = ChatState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::config::ensure_and_load(dir.path())
+                .unwrap()
+                .resolve_todo_tracker(),
+        );
+        assert_eq!(state.todo_tracker.width(), 30);
+
+        // ...then the user edits the Config pane mid-session.
+        write_tracker_config(dir.path(), 44, true);
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+
+        let restart = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await;
+                state
+            })
+        };
+
+        // The restart opens the replacement session first, then closes the old
+        // one; `refresh_model_identity` follows. Answer each in arrival order.
+        let new = next_rpc_request(&mut rx, "restart should open a new session").await;
+        assert_eq!(new["method"], method::SESSION_NEW);
+        respond_ok(
+            &rpc_out,
+            &new,
+            serde_json::json!({ "session_id": "sess-2", "workspace_dir": null }),
+        );
+        drain_pending_requests(&mut rx, &rpc_out).await;
+
+        let state = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("restart should finish")
+            .unwrap();
+
+        assert_eq!(
+            state.todo_tracker.width(),
+            44,
+            "restart must re-resolve zerocode-config.toml, not reuse the old layout"
+        );
+        assert!(
+            state.todo_tracker.is_visible(),
+            "restart must honor the newly saved enabled_at_start"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_switch_reloads_local_todo_settings() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        write_tracker_config(dir.path(), 30, false);
+        let mut state = ChatState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::config::ensure_and_load(dir.path())
+                .unwrap()
+                .resolve_todo_tracker(),
+        );
+        assert_eq!(state.todo_tracker.width(), 30);
+
+        write_tracker_config(dir.path(), 44, true);
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+
+        let entry = crate::client::SessionEntry {
+            session_id: "sess-9".to_string(),
+            session_key: "sess-9".to_string(),
+            created_at: "2026-07-07T00:00:00Z".to_string(),
+            last_activity: "2026-07-07T00:05:00Z".to_string(),
+            message_count: 0,
+            agent_alias: Some("myagent".to_string()),
+            channel_id: None,
+            name: Some("Other work".to_string()),
+        };
+
+        let switch = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::switch_to_session_entry(&client, PaneKind::Chat, &mut state, entry).await;
+                state
+            })
+        };
+
+        let rehydrate = next_rpc_request(&mut rx, "switch should rehydrate the target").await;
+        assert_eq!(rehydrate["method"], method::SESSION_NEW);
+        respond_ok(
+            &rpc_out,
+            &rehydrate,
+            serde_json::json!({ "session_id": "sess-9", "workspace_dir": null }),
+        );
+        drain_pending_requests(&mut rx, &rpc_out).await;
+
+        let state = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("switch should finish")
+            .unwrap();
+
+        assert_eq!(
+            state.todo_tracker.width(),
+            44,
+            "session switch must re-resolve zerocode-config.toml"
+        );
+        assert!(
+            state.todo_tracker.is_visible(),
+            "session switch must honor the newly saved enabled_at_start"
+        );
+    }
+
+    // A transition-time config load failure (here: an unknown, hard-erroring
+    // `ZEROCODE_todotracker__*` override) must NOT silently reset the tracker
+    // to built-in defaults. `resolve_todo_settings` returns the supplied
+    // fallback so a restart/switch keeps the user's current layout.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_load_error() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        // The in-use settings differ from the built-in defaults.
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+        assert_ne!(
+            current,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            "fallback must be distinguishable from defaults for this test to mean anything"
+        );
+
+        // An unknown override makes `ensure_and_load` hard-error.
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+        assert!(
+            crate::config::ensure_and_load(dir.path()).is_err(),
+            "precondition: the bogus override should make resolution fail"
+        );
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "a load error must keep the current settings, not reset to defaults"
+        );
+    }
+
+    // A malformed on-disk `[todotracker]` section is tolerated by
+    // `load_persisted` (defaults substituted), which previously let a botched
+    // manual edit silently reset the live tracker on restart/switch. The
+    // checked transition resolver must instead treat it as an error and keep
+    // the current settings.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_malformed_disk_section() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        // A hand-edited, malformed section on disk (width is not a number).
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "[todotracker]\nwidth = \"oops\"\n",
+        )
+        .unwrap();
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "a malformed on-disk section must keep current settings, not reset to defaults"
+        );
+    }
+
+    // An explicit zero dimension must fail visibly at the session boundary
+    // rather than normalizing to 1. At *this* layer, "fail visibly" means the
+    // transition keeps the user's current settings and logs the error instead
+    // of silently rendering a collapsed 1-cell tracker.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_file() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+        )
+        .unwrap();
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "an explicit width = 0 must keep current settings, never resolve to a 1-cell tracker"
+        );
+        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
+    }
+
+    // Same contract via the canonical environment surface.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_env() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "ZEROCODE_todotracker__width=0 must keep current settings, not normalize to 1"
+        );
+        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
+    }
+
     #[tokio::test]
     async fn open_picker_makes_chat_claim_text_input() {
         // While the picker is open the pane is modal (claims text-input so
@@ -6395,6 +9176,34 @@ mod tests {
                 None,
             ));
         }
+        assert!(chat.wants_text_input());
+    }
+
+    #[tokio::test]
+    async fn attachment_manager_makes_chat_claim_text_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("one.png"),
+            mime_type: "image/png".into(),
+            filename: "one.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        active.input_bar.insert_text("/attachments");
+        assert!(matches!(
+            active
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            crate::input_bar::InputBarAction::Consumed
+        ));
+        chat.phase = ChatPhase::Active(Box::new(active));
+
         assert!(chat.wants_text_input());
     }
 
@@ -6533,20 +9342,13 @@ mod tests {
             None,
         );
 
-        // Second request: the one-shot [todotracker] config fetch fired on the
-        // first session start. Respond with an empty field set (defaults apply).
-        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("start_session should fetch todotracker config")
-            .unwrap();
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "config/list");
-        let id = request["id"].as_str().unwrap().to_string();
-        rpc.dispatch_response(&id, Some(serde_json::json!([])), None);
-
-        // Third request must be session_new_with_id carrying the prior id for
+        // Second request must be session_new_with_id carrying the prior id for
         // the prior agent — NOT a fresh pick / fresh session. This is the whole
         // fix: a multi-agent reconnect reattaches instead of minting fresh.
+        //
+        // No config/list fetch precedes it: TodoWrite tracker settings are
+        // ZeroCode-local (`zerocode-config.toml`), resolved without a daemon
+        // round-trip, so session start goes straight to `session/new`.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("reconnect should reattach the prior session")
@@ -6695,11 +9497,6 @@ mod tests {
             chat
         });
 
-        let request = next_rpc_request(&mut rx, "resume should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "Enter should resume selected session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
@@ -6809,11 +9606,6 @@ mod tests {
             chat
         });
 
-        let request = next_rpc_request(&mut rx, "fresh start should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "Esc should start a fresh session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
@@ -6878,12 +9670,6 @@ mod tests {
         .await;
         assert_eq!(request["method"], method::SESSION_LIST_ACP);
         respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
-
-        let request =
-            next_rpc_request(&mut rx, "fresh fallback should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
 
         let request =
             next_rpc_request(&mut rx, "stale carried resume should not be sent for alpha").await;
@@ -7227,15 +10013,11 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state
             .entries
             .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
-        state.highlighted_entry = Some(0);
         state.mouse_down_entry = Some(0);
         state.mark_dirty_full();
 
@@ -7244,9 +10026,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render(frame, &mut state, area);
+                render(frame, &mut state, area, PaneKind::Chat);
             })
             .expect("draw chat");
+
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
 
         state.dirty = LinesDirty::Clean;
         chat.phase = ChatPhase::Active(Box::new(state));
@@ -7262,13 +10050,59 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert_eq!(state.highlighted_entry, None);
+        assert_eq!(state.transcript_selection, None);
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
             state.dirty,
-            LinesDirty::Full,
-            "clearing the highlight must invalidate rendered transcript lines"
+            LinesDirty::Clean,
+            "clearing an overlay-only selection must preserve cached transcript lines"
         );
+    }
+
+    #[tokio::test]
+    async fn model_picker_blocks_attachment_remove_click() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut active = state();
+        active.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("one.png"),
+            mime_type: "image/png".into(),
+            filename: "one.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        active.model_picker =
+            ModelPickerOverlay::Model(crate::widgets::PickerState::new(vec!["a".into()], None));
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut active, area, PaneKind::Chat))
+            .expect("draw chat");
+        let attachment_area = active
+            .input_bar
+            .attachment_area()
+            .expect("attachment row rendered");
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: attachment_area.x + attachment_area.width - 2,
+                row: attachment_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(active) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(active.input_bar.pending_attachments().len(), 1);
     }
 
     #[tokio::test]
@@ -7276,15 +10110,11 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
-        let (tx, _rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
+        let (mut chat, _rx) = test_chat();
         let mut state = state();
         state
             .entries
             .push(ChatEntry::AgentMessage(Arc::<str>::from("hi")));
-        state.highlighted_entry = Some(0);
         state.mouse_down_entry = Some(0);
         state.mark_dirty_full();
 
@@ -7293,9 +10123,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render(frame, &mut state, area);
+                render(frame, &mut state, area, PaneKind::Chat);
             })
             .expect("draw chat");
+
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
 
         // The rendered entry rect must hug the text, not span the panel, so
         // there is blank space beside the short message to click in.
@@ -7321,10 +10157,414 @@ mod tests {
         state.dirty = LinesDirty::Clean;
         chat.phase = ChatPhase::Active(Box::new(state));
 
-        let click = MouseEvent {
+        let mouse_down = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: blank_col,
             row: blank_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(mouse_down, area).await;
+        let mouse_up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: blank_col,
+            row: blank_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(mouse_up, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.mouse_down_entry, None);
+        assert_eq!(
+            state.dirty,
+            LinesDirty::Clean,
+            "clearing an overlay-only selection must preserve cached transcript lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_message_copy_action_stays_in_browse_mode() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area, PaneKind::Chat);
+            })
+            .expect("draw chat");
+
+        let entry_rect = state
+            .entry_rects
+            .first()
+            .expect("entry region should be rendered")
+            .1;
+        let rows_before = state.cached_total_rows;
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: entry_rect.x + 1,
+            row: entry_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.browse_cursor, None,
+            "normal-mode click must not enter browse mode"
+        );
+        assert!(
+            state.info_message.is_none(),
+            "normal-mode click must not copy or show copied feedback"
+        );
+        assert!(
+            state.copy_hit_regions.is_empty(),
+            "normal-mode click must not reveal a copy action"
+        );
+
+        state.enter_browse_mode();
+
+        terminal
+            .draw(|frame| {
+                render(frame, state, area, PaneKind::Chat);
+            })
+            .expect("redraw browse-mode chat");
+        let selected_entry_rect = state
+            .entry_rects
+            .first()
+            .expect("selected entry region should still be rendered")
+            .1;
+        assert_eq!(
+            state.cached_total_rows, rows_before,
+            "message copy affordance must overlay the transcript without adding rows"
+        );
+        assert_eq!(
+            selected_entry_rect.y, entry_rect.y,
+            "revealing message copy must not push earlier transcript rows"
+        );
+
+        let copy_rect = state
+            .copy_hit_regions
+            .iter()
+            .find(|region| region.text == "hello")
+            .expect("browse-mode selected message copy action should be rendered")
+            .rect;
+        assert_eq!(
+            copy_rect.y, selected_entry_rect.y,
+            "message copy action should overlay the selected row"
+        );
+        let body_x = area.x + 1;
+        let body_width = area.width.saturating_sub(2);
+        let expected_x = body_x + body_width.saturating_sub(copy_rect.width) / 2;
+        assert_eq!(
+            copy_rect.x, expected_x,
+            "message copy action should be horizontally centered in the chat body"
+        );
+        let copy_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: copy_rect.x,
+            row: copy_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(copy_click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.info_message.as_ref().map(|m| m.text.as_str()),
+            Some(crate::i18n::t("zc-chat-copied-clipboard").as_str()),
+            "explicit message copy action should copy"
+        );
+        assert_eq!(
+            state.browse_cursor, None,
+            "copy action should dismiss selection"
+        );
+        assert!(
+            matches!(
+                state.copy_feedback,
+                Some(CopyFeedback {
+                    target: CopyFeedbackTarget::Overlay(_),
+                    ..
+                })
+            ),
+            "message copy should leave a transient copied-state cue"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_click_uses_platform_secondary_click_behavior() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "select just this word",
+        )));
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area, PaneKind::Chat);
+            })
+            .expect("draw chat");
+        let entry_rect = state
+            .entry_rects
+            .first()
+            .expect("entry region should be rendered")
+            .1;
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: entry_rect.x + 1,
+            row: entry_rect.y,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(
+            state.info_message.is_none(),
+            "modifier-click outside browse mode must not app-copy the whole message"
+        );
+        assert_eq!(
+            state.browse_cursor, None,
+            "modifier-click outside browse mode should not select the whole message"
+        );
+        assert_eq!(
+            state.context_menu.is_some(),
+            cfg!(target_os = "macos"),
+            "Control+click should open the context menu only on macOS"
+        );
+    }
+
+    #[tokio::test]
+    async fn right_click_context_menu_activation_runs_through_mouse_boundary() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.mark_dirty_full();
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+        let entry_rect = state.entry_rects[0].1;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: entry_rect.x + 1,
+                row: entry_rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let menu_action = {
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            let menu = state.context_menu.as_ref().expect("menu opens");
+            assert!(state.info_message.is_none());
+            (menu.rect.x + 1, menu.rect.y + 1)
+        };
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: menu_action.0,
+                row: menu_action.1,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.context_menu.is_none());
+        assert!(state.info_message.is_some());
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn outside_click_dismisses_context_menu_without_copying() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.mark_dirty_full();
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+        let entry_rect = state.entry_rects[0].1;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: entry_rect.x + 1,
+                row: entry_rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.context_menu.is_some());
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.context_menu.is_none());
+        assert!(state.info_message.is_none());
+        assert!(state.copy_feedback.is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_up_after_browse_drag_does_not_copy_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("first")));
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("second")));
+        state.browse_cursor = Some(1);
+        state.browse_anchor = Some(0);
+        state.mouse_down_entry = Some(0);
+        state.mark_dirty_full();
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(up, Rect::new(0, 0, 80, 20)).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.mouse_down_entry, None);
+        assert!(
+            state.info_message.is_none(),
+            "ending a mouse drag must not app-copy the selected messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_copy_shows_shared_feedback() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("previous")));
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```bash\necho hello\n```",
+        )));
+        state.mark_dirty_full();
+        assert!(!state.in_browse_mode());
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area, PaneKind::Chat);
+            })
+            .expect("draw chat");
+
+        let code_regions: Vec<CopyHitRegion> = state
+            .copy_hit_regions
+            .iter()
+            .filter(|region| region.text == "echo hello")
+            .cloned()
+            .collect();
+        assert_eq!(
+            code_regions.len(),
+            2,
+            "top and bottom fence labels should both be copy targets"
+        );
+        assert_eq!(
+            code_regions[0].group, code_regions[1].group,
+            "top and bottom copy targets for one fence should share feedback"
+        );
+        let copy_rect = code_regions[0].rect;
+        let copy_group = code_regions[0].group;
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: copy_rect.x,
+            row: copy_rect.y,
             modifiers: KeyModifiers::NONE,
         };
         chat.handle_mouse(click, area).await;
@@ -7332,13 +10572,61 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert_eq!(state.highlighted_entry, None);
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
-            state.dirty,
-            LinesDirty::Full,
-            "clearing the highlight must invalidate rendered transcript lines"
+            state.info_message.as_ref().map(|m| m.text.as_str()),
+            Some(crate::i18n::t("zc-chat-copied-clipboard").as_str())
         );
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Code(group),
+                ..
+            }) if group == copy_group
+        ));
+    }
+
+    #[tokio::test]
+    async fn browse_mode_code_copy_clears_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```sh\necho hi\n```",
+        )));
+        state.browse_cursor = Some(0);
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(2, 2, 6, 1),
+            text: "echo hi".to_string(),
+            kind: CopyHitKind::Code,
+            group: 0,
+        });
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.browse_cursor, None);
+        assert!(state.info_message.is_some());
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Code(0),
+                ..
+            })
+        ));
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {
@@ -7348,7 +10636,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_total_rows_matches_full_line_count() {
+    fn copy_cached_total_rows_and_breaks_match_full_line_count() {
         let width: u16 = 40;
         let mut s = state();
 
@@ -7360,6 +10648,11 @@ mod tests {
             s.cached_total_rows,
             authoritative_rows(&s, width),
             "full-rebuild row total must match line_count"
+        );
+        assert_eq!(
+            s.cached_row_breaks.len(),
+            usize::from(s.cached_total_rows),
+            "full rebuild must cache one separator per rendered row"
         );
 
         for i in 50..60 {
@@ -7376,6 +10669,11 @@ mod tests {
             authoritative_rows(&s, width),
             "incremental-append row total must match line_count"
         );
+        assert_eq!(
+            s.cached_row_breaks.len(),
+            usize::from(s.cached_total_rows),
+            "incremental append must preserve separator alignment"
+        );
 
         let narrower: u16 = 20;
         s.rebuild_lines(narrower);
@@ -7383,6 +10681,11 @@ mod tests {
             s.cached_total_rows,
             authoritative_rows(&s, narrower),
             "width change must force a recompute that still matches line_count"
+        );
+        assert_eq!(
+            s.cached_row_breaks.len(),
+            usize::from(s.cached_total_rows),
+            "width rebuild must realign cached separators"
         );
     }
 
@@ -7531,6 +10834,25 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_update_adds_visible_system_notice() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            kept_turns: 3,
+            reason: "history message limit exceeded".to_string(),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("history message limit exceeded")
+                    && text.contains("12")
+                    && text.contains("3")
+        ));
+    }
+
+    #[test]
     fn tool_call_followed_by_result_is_one_entry() {
         let mut s = state();
         s.apply_update(SessionUpdate::ToolCall {
@@ -7606,6 +10928,175 @@ mod tests {
             cell.style().bg,
             Some(expected_bg),
             "approval overlay interior must use the active ZeroCode theme background"
+        );
+    }
+
+    #[test]
+    fn queue_sidebar_uses_theme_background_after_clear() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let expected_bg = theme::background();
+        assert_ne!(
+            expected_bg,
+            ratatui::style::Color::Reset,
+            "default ZeroCode theme should provide a concrete sidebar background"
+        );
+
+        let mut s = state();
+        s.enqueue_message("what's happening".to_string(), Vec::new())
+            .expect("queue message");
+        s.enqueue_message("second queued message".to_string(), Vec::new())
+            .expect("queue message");
+        s.ensure_queue_selection();
+
+        let area = Rect::new(0, 0, 36, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_queue_sidebar(frame, &mut s, area);
+            })
+            .expect("draw queue sidebar");
+
+        let cell = &terminal.backend().buffer()[(4, 6)];
+        assert_eq!(
+            cell.style().bg,
+            Some(expected_bg),
+            "queue sidebar interior must use the active ZeroCode theme background"
+        );
+
+        let unselected_text_cell = &terminal.backend().buffer()[(6, 2)];
+        assert_eq!(
+            unselected_text_cell.style().fg,
+            Some(theme::active().body),
+            "unselected queue text must use the active ZeroCode body foreground"
+        );
+        assert_eq!(
+            unselected_text_cell.style().bg,
+            Some(expected_bg),
+            "unselected queue text must keep the themed fill background"
+        );
+    }
+
+    #[test]
+    fn session_list_overlay_uses_theme_background_after_clear() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let expected_bg = theme::background();
+        assert_ne!(
+            expected_bg,
+            ratatui::style::Color::Reset,
+            "default ZeroCode theme should provide a concrete modal background"
+        );
+
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                );
+            })
+            .expect("draw session list overlay");
+
+        let cell = &terminal.backend().buffer()[(overlay_area.x + 4, overlay_area.y + 6)];
+        assert_eq!(
+            cell.style().bg,
+            Some(expected_bg),
+            "session list overlay interior must use the active ZeroCode theme background"
+        );
+
+        let selected_text_cell =
+            &terminal.backend().buffer()[(overlay_area.x + 4, overlay_area.y + 1)];
+        assert_eq!(
+            selected_text_cell.style().fg,
+            Some(theme::active().heading),
+            "selected session row must keep the overlay highlight foreground"
+        );
+        assert_eq!(
+            selected_text_cell.style().bg,
+            Some(expected_bg),
+            "selected session row must keep the themed fill background"
+        );
+    }
+
+    #[test]
+    fn session_overlay_retains_scroll_offset_for_mouse_hit_test() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // Regression for the picker selecting the wrong row after scrolling:
+        // the renderer must persist the offset it computes so mouse hit-testing
+        // reads the same geometry that was drawn.
+        let sessions: Vec<SessionEntry> = (0..30)
+            .map(|i| SessionEntry {
+                session_id: format!("session-{i}"),
+                session_key: format!("session-{i}"),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                agent_alias: Some("agent".to_string()),
+                channel_id: None,
+                name: Some(format!("prompt {i}")),
+                message_count: 1,
+            })
+            .collect();
+
+        let mut list_state = ListState::default();
+        // Select a row far enough down that the list must scroll to show it.
+        list_state.select(Some(25));
+
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                );
+            })
+            .expect("draw session list overlay");
+
+        // The renderer scrolled the list to reveal the selection; that offset
+        // must survive the draw. Before the fix it was computed on a discarded
+        // copy and stayed 0.
+        let offset = list_state.offset();
+        assert!(
+            offset > 0,
+            "rendering a scrolled selection must retain a nonzero offset, got {offset}"
+        );
+
+        // A click on the third visible row must resolve through the retained
+        // offset, not the pre-scroll top of the list.
+        let clicked_row = overlay_area.y + 1 + 2;
+        let idx = crate::mouse::list_click_index(clicked_row, overlay_area, offset, sessions.len())
+            .expect("click inside the visible list resolves to a row");
+        assert_eq!(
+            idx,
+            offset + 2,
+            "clicked row must map to offset + visible row, not the unscrolled index"
         );
     }
 
@@ -7837,6 +11328,80 @@ mod tests {
             matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "Before tool.")
         );
         assert!(matches!(&s.entries()[1], ChatEntry::Tool { .. }));
+    }
+
+    /// When no streaming text was accumulated, commit_turn must use the
+    /// daemon-provided final text as a fallback — rendered exactly once.
+    #[test]
+    fn commit_turn_renders_nonempty_fallback_when_no_streaming() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // No streaming chunks; commit_turn receives non-empty final text.
+        s.commit_turn("Hello from daemon.".to_string(), true);
+
+        assert_eq!(s.entries().len(), 1);
+        assert!(
+            matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "Hello from daemon.")
+        );
+    }
+
+    /// When a turn completes with no streamed text, no tool calls, and no
+    /// final content, commit_turn must render a diagnostic system message
+    /// so the user knows the turn finished.
+    #[test]
+    fn commit_turn_shows_diagnostic_when_no_output_at_all() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // Empty everything: no streaming, no tools, empty final text.
+        s.commit_turn(String::new(), true);
+
+        assert_eq!(s.entries().len(), 1);
+        assert!(
+            matches!(&s.entries()[0], ChatEntry::SystemMessage(t) if t.as_ref() == "Turn completed with no output."),
+            "expected diagnostic SystemMessage for empty completion, got {:?}",
+            s.entries()[0]
+        );
+    }
+
+    /// When a cancelled or failed turn has no output, commit_turn must NOT
+    /// append the "Turn completed with no output" diagnostic — cancelled/
+    /// failed turns are not clean completions and should not claim otherwise.
+    #[test]
+    fn commit_turn_no_diagnostic_when_not_clean() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // Clean=false (cancelled/failed), empty everything.
+        s.commit_turn(String::new(), false);
+
+        assert!(
+            s.entries().is_empty(),
+            "cancelled turn should not emit completion diagnostic, got {:?}",
+            s.entries()
+        );
+    }
+
+    /// When tool calls were made during a turn but no text was streamed and
+    /// final text is empty, commit_turn must NOT add a diagnostic — the tool
+    /// entries are the visible record of work.
+    #[test]
+    fn commit_turn_no_diagnostic_when_tool_calls_present() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc1".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "ls"}),
+        });
+        s.commit_turn(String::new(), true);
+
+        // Only the Tool entry — no diagnostic needed.
+        assert_eq!(s.entries().len(), 1);
+        assert!(matches!(&s.entries()[0], ChatEntry::Tool { .. }));
     }
 
     #[test]
@@ -8243,6 +11808,144 @@ mod tests {
         }
     }
 
+    fn clipboard_att(path: &std::path::Path, filename: &str) -> PendingAttachment {
+        PendingAttachment {
+            path: path.to_path_buf(),
+            mime_type: "image/png".to_string(),
+            filename: filename.to_string(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatched_attachments_are_cleaned_on_completion_without_touching_user_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("clipboard.png");
+        std::fs::write(&clipboard_path, b"clipboard").expect("write clipboard temp");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc,
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message(
+                "send attachments".to_string(),
+                vec![
+                    clipboard_att(&clipboard_path, "clipboard.png"),
+                    PendingAttachment {
+                        path: user_path.clone(),
+                        mime_type: "image/png".to_string(),
+                        filename: "user.png".to_string(),
+                        size_bytes: 4,
+                        source: crate::attachment::AttachmentSource::File,
+                    },
+                ],
+            )
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.pump_queue();
+
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.turn_in_flight);
+        assert_eq!(state.active_turn_attachments.len(), 2);
+        assert!(clipboard_path.exists());
+        state.commit_turn(String::new(), true);
+
+        assert!(
+            !clipboard_path.exists(),
+            "active clipboard temp must be removed"
+        );
+        assert!(user_path.exists(), "user-selected file must be preserved");
+        assert!(state.active_turn_attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serialization_failure_cleans_dispatched_clipboard_temp_and_reports_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("clipboard-temp");
+        std::fs::create_dir(&clipboard_path).expect("create forced-failure path");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc,
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message(
+                "cannot serialize".to_string(),
+                vec![
+                    clipboard_att(&clipboard_path, "clipboard.png"),
+                    PendingAttachment {
+                        path: user_path.clone(),
+                        mime_type: "image/png".to_string(),
+                        filename: "user.png".to_string(),
+                        size_bytes: 4,
+                        source: crate::attachment::AttachmentSource::File,
+                    },
+                ],
+            )
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.pump_queue();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(!state.turn_in_flight);
+        assert!(state.active_turn_attachments.is_empty());
+        assert!(
+            clipboard_path.exists(),
+            "failed cleanup must leave the path"
+        );
+        assert!(user_path.exists(), "user-selected file must be preserved");
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("1 temporary file"))
+        );
+        let clipboard_path = clipboard_path.to_string_lossy();
+        assert!(state.entries.iter().all(|entry| match entry {
+            ChatEntry::SystemMessage(text) => !text.contains(clipboard_path.as_ref()),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn completion_does_not_delete_an_unsent_composer_attachment() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("composer.png");
+        std::fs::write(&clipboard_path, b"clipboard").expect("write clipboard temp");
+
+        let mut active = state();
+        active.input_bar.load_for_edit(
+            String::new(),
+            vec![clipboard_att(&clipboard_path, "composer.png")],
+        );
+        active.turn_in_flight = true;
+
+        active.commit_turn(String::new(), false);
+
+        assert!(clipboard_path.exists());
+        assert_eq!(active.input_bar.pending_attachments().len(), 1);
+    }
+
     #[test]
     fn enqueue_dispatches_immediately_when_idle() {
         let mut s = state();
@@ -8315,6 +12018,240 @@ mod tests {
         s.turn_in_flight = false;
         assert_eq!(s.take_next_dispatchable().unwrap().text, "urgent");
         assert_eq!(s.take_next_dispatchable().unwrap().text, "pending1");
+    }
+
+    #[test]
+    fn queue_action_send_now_preserves_payload_and_injected_fifo() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.inject_message("already urgent".to_string(), Vec::new())
+            .unwrap();
+        s.enqueue_message("ordinary one".to_string(), Vec::new())
+            .unwrap();
+        s.enqueue_message("promote me".to_string(), vec![att("keep.txt")])
+            .unwrap();
+        s.enqueue_message("ordinary two".to_string(), Vec::new())
+            .unwrap();
+        let promoted_id = s.message_queue[2].id;
+        s.queue_paused = true;
+
+        assert!(s.promote_queued_by_id(promoted_id));
+        assert!(!s.queue_paused());
+        assert!(s.resume_override);
+        assert_eq!(
+            s.message_queue
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "already urgent",
+                "promote me",
+                "ordinary one",
+                "ordinary two"
+            ]
+        );
+        let promoted = &s.message_queue[1];
+        assert_eq!(promoted.id, promoted_id);
+        assert_eq!(promoted.status, QueueItemStatus::Injected);
+        assert_eq!(promoted.attachments.len(), 1);
+        assert_eq!(promoted.attachments[0].filename, "keep.txt");
+    }
+
+    #[test]
+    fn queue_action_send_now_is_idempotent_for_injected_items() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.inject_message("first".to_string(), Vec::new()).unwrap();
+        s.inject_message("second".to_string(), Vec::new()).unwrap();
+        let second_id = s.message_queue[1].id;
+
+        assert!(s.promote_queued_by_id(second_id));
+        assert!(s.promote_queued_by_id(second_id));
+        assert_eq!(
+            s.message_queue
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn queue_action_menu_targets_clicked_id_and_orders_actions() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("first".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("second".to_string(), Vec::new()).unwrap();
+        let second_id = s.message_queue[1].id;
+        s.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 12));
+        s.queue_item_rects = vec![
+            (s.message_queue[0].id, Rect::new(41, 3, 28, 2)),
+            (second_id, Rect::new(41, 5, 28, 2)),
+        ];
+
+        assert!(s.open_queue_context_menu(45, 5));
+        assert_eq!(s.queue_sel, Some(second_id));
+        let menu = s.context_menu.as_ref().expect("queue menu opens");
+        assert_eq!(menu.target.actions(), QUEUE_CONTEXT_ACTIONS);
+        assert!(matches!(menu.target, ChatContextMenuTarget::Queue(id) if id == second_id));
+
+        s.context_menu_select_step(1);
+        assert_eq!(
+            s.take_context_menu_request(),
+            Some(ChatContextMenuRequest::Queue {
+                id: second_id,
+                action: ChatContextMenuAction::Copy,
+            })
+        );
+    }
+
+    #[test]
+    fn queue_action_menu_navigation_clamps_at_boundaries() {
+        let target = ChatContextMenuTarget::Queue(1);
+        let mut menu = ChatContextMenu {
+            rect: Rect::new(0, 0, 16, 6),
+            target,
+            selected: 0,
+        };
+
+        menu.select_step(-1);
+        assert_eq!(menu.selected_action(), Some(ChatContextMenuAction::SendNow));
+        menu.selected = QUEUE_CONTEXT_ACTIONS.len() - 1;
+        menu.select_step(1);
+        assert_eq!(menu.selected_action(), Some(ChatContextMenuAction::Delete));
+    }
+
+    #[test]
+    fn queue_action_copy_lookup_does_not_mutate_queue() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("copy me".to_string(), vec![att("keep.txt")])
+            .unwrap();
+        s.ensure_queue_selection();
+        let id = s.selected_queue_id().unwrap();
+        let before_selection = s.queue_sel;
+
+        assert_eq!(s.queued_text(id).as_deref(), Some("copy me"));
+        assert_eq!(s.queue_len(), 1);
+        assert_eq!(s.queue_sel, before_selection);
+        assert_eq!(s.message_queue[0].id, id);
+        assert_eq!(s.message_queue[0].status, QueueItemStatus::Pending);
+        assert_eq!(s.message_queue[0].attachments[0].filename, "keep.txt");
+    }
+
+    #[tokio::test]
+    async fn queue_action_send_now_requests_cancel_only_once() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.turn_in_flight = true;
+        active
+            .enqueue_message("send now".to_string(), Vec::new())
+            .unwrap();
+        let id = active.message_queue[0].id;
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let first = tokio::spawn(async move {
+            chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+                id,
+                action: ChatContextMenuAction::SendNow,
+            })
+            .await;
+            chat
+        });
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("send now should request cancellation")
+            .expect("writer channel open");
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method::SESSION_CANCEL);
+        let request_id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &request_id,
+            Some(serde_json::json!({"session_id":"sess-1","cancelled":true})),
+            None,
+        );
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("send now should finish after cancel response")
+            .unwrap();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(matches!(state.turn_status, TurnStatus::Cancelling));
+        assert_eq!(state.message_queue[0].status, QueueItemStatus::Injected);
+
+        chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+            id,
+            action: ChatContextMenuAction::SendNow,
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "an already-cancelling turn must not emit another cancel request"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_action_send_now_dispatches_after_cancel_failure() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.turn_in_flight = true;
+        active
+            .enqueue_message("recover me".to_string(), Vec::new())
+            .unwrap();
+        let id = active.message_queue[0].id;
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let action = tokio::spawn(async move {
+            chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+                id,
+                action: ChatContextMenuAction::SendNow,
+            })
+            .await;
+            chat
+        });
+        let cancel_line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("send now should request cancellation")
+            .expect("writer channel open");
+        let cancel: serde_json::Value = serde_json::from_str(&cancel_line).unwrap();
+        let request_id = cancel["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &request_id,
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code: -32000,
+                message: "cancel failed".to_string(),
+                data: None,
+            }),
+        );
+        let chat = tokio::time::timeout(Duration::from_secs(2), action)
+            .await
+            .expect("failed cancellation should settle locally")
+            .unwrap();
+        let prompt_line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("promoted item should dispatch after cancel failure")
+            .expect("writer channel open");
+        let prompt: serde_json::Value = serde_json::from_str(&prompt_line).unwrap();
+        assert_eq!(prompt["method"], method::SESSION_PROMPT);
+        assert_eq!(prompt["params"]["prompt"], "recover me");
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.turn_in_flight);
+        assert!(!state.queue_paused());
+        assert!(state.message_queue.is_empty());
     }
 
     #[test]
@@ -8597,9 +12534,31 @@ mod tests {
         s.turn_in_flight = true;
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
         s.queue_paused = true;
-        s.reset_for_session("sess-2".to_string(), None);
+        s.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(1, 1, 6, 1),
+            text: "stale".to_string(),
+            kind: CopyHitKind::Message,
+            group: 0,
+        });
+        s.copy_feedback = Some(CopyFeedback {
+            target: CopyFeedbackTarget::Overlay(Rect::new(1, 1, 8, 1)),
+            shown_at: Instant::now(),
+        });
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert_eq!(s.queue_len(), 0);
         assert!(!s.queue_paused());
+        assert!(
+            s.copy_hit_regions.is_empty(),
+            "session reset must clear stale copy hit regions"
+        );
+        assert!(
+            s.copy_feedback.is_none(),
+            "session reset must clear stale copy feedback"
+        );
     }
 
     #[test]
@@ -8736,38 +12695,159 @@ mod tests {
     fn reset_for_session_clears_first_message() {
         let mut s = state();
         s.push_user_message(Some("ask".to_string()), Vec::new());
-        s.reset_for_session("sess-2".to_string(), None);
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert!(s.first_message.is_none());
+    }
+
+    #[test]
+    fn reset_for_session_clears_todo_plan() {
+        // A TodoWrite plan belongs to the session that produced it, so
+        // switching sessions must not leave the previous session's tasks
+        // rendered in the pane.
+        use crate::wire::{PlanEntry, PlanPriority, PlanStatus};
+        let mut s = state();
+        s.todo_tracker.set_plan(vec![
+            PlanEntry {
+                content: "task one".to_string(),
+                status: PlanStatus::InProgress,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            },
+            PlanEntry {
+                content: "task two".to_string(),
+                status: PlanStatus::Pending,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            },
+        ]);
+        assert_eq!(s.todo_tracker.total(), 2);
+
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        assert_eq!(
+            s.todo_tracker.total(),
+            0,
+            "a session switch must drop the previous session's TodoWrite plan"
+        );
+        assert!(!s.todo_tracker.is_visible());
     }
 
     #[test]
     fn load_history_replays_transcript_and_seeds_first_message() {
         use crate::client::MessageEntry;
         let mut s = state();
-        s.reset_for_session("sess-resume".to_string(), None);
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         let before = s.entries.len();
-        s.load_history(vec![
-            MessageEntry {
-                role: "user".to_string(),
-                content: "first ask".to_string(),
-            },
-            MessageEntry {
-                role: "assistant".to_string(),
-                content: "reply".to_string(),
-            },
-            MessageEntry {
-                role: "system".to_string(),
-                content: "ignored".to_string(),
-            },
-            MessageEntry {
-                role: "user".to_string(),
-                content: "second ask".to_string(),
-            },
-        ]);
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "first ask".to_string(),
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "reply".to_string(),
+                },
+                MessageEntry {
+                    role: "system".to_string(),
+                    content: "ignored".to_string(),
+                },
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "second ask".to_string(),
+                },
+            ],
+            false,
+        );
         // User + assistant + user replayed; system dropped.
         assert_eq!(s.entries.len(), before + 3);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn load_history_strips_enrichment_prefix_from_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nfirst ask".to_string(),
+            }],
+            true,
+        );
+        // The pinned row renders a single line; it must show the message
+        // text, not the runtime's timestamp prefix.
+        assert_eq!(s.first_message.as_deref(), Some("first ask"));
+        // The transcript entry keeps the persisted content untouched.
+        assert!(matches!(
+            &s.entries[s.entries.len() - 1],
+            ChatEntry::UserMessage { text: Some(t), .. }
+                if t.starts_with("[CURRENT DATE & TIME:") && t.ends_with("first ask")
+        ));
+    }
+
+    #[test]
+    fn load_history_skips_prefix_only_content_when_seeding_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\n".to_string(),
+            }],
+            true,
+        );
+        // A message that strips to nothing must not claim the pinned row —
+        // Some("") would block a later real message from ever seeding it.
+        assert!(s.first_message.is_none());
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:31:00 UTC]\n\nreal ask".to_string(),
+            }],
+            true,
+        );
+        assert_eq!(s.first_message.as_deref(), Some("real ask"));
+    }
+
+    #[test]
+    fn load_history_preserves_literal_timestamp_example_for_chat_sessions() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        let literal = "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nthis is user-authored";
+
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: literal.to_string(),
+            }],
+            false,
+        );
+
+        assert_eq!(s.first_message.as_deref(), Some(literal));
     }
 
     // ── Elicitation modal ────────────────────────────────────────
@@ -8881,7 +12961,11 @@ mod tests {
     fn reset_for_session_clears_pending_elicitation() {
         let mut s = state();
         s.set_pending_elicitation(single_elicitation());
-        s.reset_for_session("sess-2".to_string(), None);
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert!(
             s.pending_elicitation().is_none(),
             "a session switch must drop any stale elicitation modal"
@@ -8917,10 +13001,248 @@ mod tests {
     }
 
     fn test_chat() -> (Chat, mpsc::Receiver<String>) {
+        test_chat_with_transport(crate::client::Transport::Local)
+    }
+
+    fn test_chat_with_transport(
+        transport: crate::client::Transport,
+    ) -> (Chat, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let client = Arc::new(RpcClient::with_rpc_transport(rpc, transport));
         (Chat::new(client, PaneKind::Chat), rx)
+    }
+
+    fn chat_with_active_input(kind: PaneKind) -> Chat {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let mut chat = Chat::new(client, kind);
+        let mut active = state();
+        active.input_bar.insert_text("alpha beta");
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat
+    }
+
+    fn active_state(chat: &mut Chat) -> &mut ChatState {
+        let ChatPhase::Active(active) = &mut chat.phase else {
+            unreachable!();
+        };
+        active
+    }
+
+    #[tokio::test]
+    async fn active_turn_paste_populates_composer_and_queues_on_submit() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.clear_input();
+        state.turn_in_flight = true;
+
+        chat.handle_paste("pasted while active");
+
+        let state = active_state(&mut chat);
+        assert_eq!(state.input_bar.input(), "pasted while active");
+        assert!(state.turn_in_flight);
+
+        let InputBarAction::Submit { text, attachments } =
+            state.input_bar.submit_current_input_for_test()
+        else {
+            panic!("pasted input must submit normally");
+        };
+        state
+            .enqueue_message(text.unwrap_or_default(), attachments)
+            .expect("pasted input queues during an active turn");
+
+        assert_eq!(state.queue_len(), 1);
+        assert!(
+            state.take_next_dispatchable().is_none(),
+            "an active turn must not dispatch the queued pasted input"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_composer_while_approval_is_pending() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_approval = Some(PendingApproval {
+            request_id: "request-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+
+        chat.handle_paste(" must not reach the composer");
+
+        assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_hidden_composer_when_another_surface_owns_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut cases = Vec::new();
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+        cases.push(("model picker", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_elicitation = Some(single_elicitation());
+        cases.push(("elicitation", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).session_overlay = SessionOverlay::List {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+        };
+        cases.push(("session picker", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 20, 5),
+            target: ChatContextMenuTarget::Queue(1),
+            selected: 0,
+        });
+        cases.push(("context menu", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("already-attached.png"),
+            mime_type: "image/png".into(),
+            filename: "already-attached.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        state.input_bar.clear_input();
+        state.input_bar.insert_text("/attachments");
+        assert!(matches!(
+            state
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputBarAction::Consumed
+        ));
+        cases.push(("attachment manager", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        assert!(matches!(
+            active_state(&mut chat)
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            InputBarAction::Consumed
+        ));
+        cases.push(("file explorer", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        cases.push(("browse mode", chat));
+
+        let attachment_path = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        for (surface, mut chat) in cases {
+            let state = active_state(&mut chat);
+            let original_input = state.input_bar.input().to_string();
+            let original_attachment_count = state.input_bar.pending_attachments().len();
+
+            chat.handle_paste(" hidden text");
+            chat.handle_paste(&attachment_path);
+
+            let state = active_state(&mut chat);
+            assert_eq!(
+                state.input_bar.input(),
+                original_input,
+                "{surface} must keep pasted text out of the hidden composer"
+            );
+            assert_eq!(
+                state.input_bar.pending_attachments().len(),
+                original_attachment_count,
+                "{surface} must not create hidden attachments from pasted paths"
+            );
+        }
+    }
+
+    #[test]
+    fn file_explorer_attachment_error_reaches_info_notice() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Keep the explorer listing deterministic and let the guard clean up
+        // the oversized fixture even when an assertion fails.
+        let temp_dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let oversized_path = temp_dir.path().join("oversized.bin");
+        let file = std::fs::File::create(&oversized_path).expect("create oversized attachment");
+        file.set_len(10 * 1024 * 1024 + 1)
+            .expect("make attachment exceed the 10 MiB limit");
+
+        let mut state = state();
+        state
+            .input_bar
+            .open_file_explorer_for_test(oversized_path.clone());
+
+        assert!(
+            state.handle_input_bar_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,))
+        );
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|notice| !notice.text.is_empty()),
+            "a rejected file-explorer attachment must produce visible feedback regardless of locale"
+        );
+        assert!(!state.input_bar.has_file_explorer());
+    }
+
+    #[tokio::test]
+    async fn pane_navigation_claims_only_unobstructed_active_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let chat = chat_with_active_input(kind);
+            assert!(chat.claims_pane_navigation(&word_left));
+        }
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).input_bar.clear_input();
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).pending_elicitation = Some(single_elicitation());
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).pending_approval = Some(PendingApproval {
+            request_id: "request-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).session_overlay = SessionOverlay::List {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+        };
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let (mut chat, _rx) = test_chat();
+        chat.phase = ChatPhase::PickSession {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+            agents: Vec::new(),
+        };
+        assert!(!chat.claims_pane_navigation(&word_left));
     }
 
     #[tokio::test]

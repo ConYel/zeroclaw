@@ -1,9 +1,9 @@
 # FND-002: Intentional Documentation: Standards, Structure, and i18n Strategy
 
-> Starting v0.7.0 · Type: Documentation · Rev. 3
+> Starting v0.7.0 · Type: Documentation · Rev. 7
 >
-> **Canonical reference** · Ratified by the team · Rev. 3
-> Discussion thread and full revision history: [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576)
+> **Canonical reference** · Ratified by the team · Rev. 7
+> Original RFC discussion: [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576)
 
 ---
 
@@ -34,8 +34,33 @@
 | Rev | Date | Summary |
 |---|---|---|
 | 1 | 2026-04-20 | Initial ratified documentation standard |
-| 2 | 2026-07-14 | Reconciled the foundational ADR backlog with the restored ADR set and separated retroactive records from implementation-gated roadmap decisions |
-| 3 | 2026-07-18 | Added proposed ADR-006 and ADR-007 records for the resolved runtime-channel-plugin and separate-gateway-process targets while keeping acceptance implementation-gated |
+| 2 | 2026-06-21 | Changed the foundational plugin ADR target from the Extism model to the Extism-to-WIT transition ([#8061](https://github.com/zeroclaw-labs/zeroclaw/pull/8061)) |
+| 3 | 2026-07-05 | Reconciled the canonical ADR location and set, and moved the RFC lifecycle from proposal files and PRs to RFC issues ([#8694](https://github.com/zeroclaw-labs/zeroclaw/pull/8694)) |
+| 4 | 2026-07-14 | Reconciled the foundational ADR backlog with the restored ADR set and separated retroactive records from implementation-gated roadmap decisions ([#9042](https://github.com/zeroclaw-labs/zeroclaw/pull/9042)) |
+| 5 | 2026-07-18 | Added proposed ADR-006 and ADR-007 records for the resolved runtime-channel-plugin and separate-gateway-process targets while keeping acceptance implementation-gated ([#9133](https://github.com/zeroclaw-labs/zeroclaw/pull/9133)) |
+| 6 | 2026-07-20 | Defined the compact root coding-agent contract, architecture-map routing, optional detailed guidance, and crate-policy safety floor ([#9050](https://github.com/zeroclaw-labs/zeroclaw/pull/9050)) |
+| 7 | 2026-08-06 | Defined the foundation revision policy and reconciled revision metadata across the FND suite ([#9778](https://github.com/zeroclaw-labs/zeroclaw/pull/9778)) |
+
+### Foundation Revision Policy
+
+Foundation revision metadata preserves draft revisions incorporated into the
+ratified baseline and records the evolution of normative decisions after
+ratification. Advance the displayed revision and add one chronological row
+when a merged change alters architecture, required process, release contracts,
+contributor behavior, or ownership of an authoritative source. A later
+reversal is a separate revision because both states governed the project in
+sequence. Issue-only drafts excluded from ratification do not count.
+
+Do not advance the revision for moves, formatting, punctuation, heading
+normalization, link repairs, or path updates that do not change the contract.
+When a foundation document explicitly delegates operational details to another
+maintained source, changes confined to those details do not revise the
+foundation document.
+
+The two displayed revision values and the highest local revision-history row
+must be updated together in the same change. Rows added with an amendment keep
+the amendment's assigned revision date. When history is backfilled later, use
+the date the change entered `master`.
 
 ---
 
@@ -339,7 +364,7 @@ When an AI coding assistant reads a repository, it sees the code as it is now. I
 
 ### 7.1 The Pattern
 
-The root `AGENTS.md` is the project's strongest existing contribution to AI-assisted development. It tells AI coding assistants the commands to run, the architecture to respect, the risk tiers to apply, and the anti-patterns to avoid. It works because it is specific, opinionated, and short.
+The root `AGENTS.md` is the project's compact, always-loaded contract for AI-assisted development. It owns project-wide safety, privacy, authorization, contribution, and validation policy. The architecture and contribution map routes non-trivial tasks to their relevant sources, while the coding agent guidelines hold optional detail such as examples, current stability assignments, skill discovery, and protected operational documents. This layered contract stays specific and opinionated without loading every detail into every session.
 
 As the workspace decomposes into crates (per the microkernel architecture RFC), each crate should have its own `AGENTS.md`. This is the mechanism by which architectural boundaries become enforceable at the AI-assistance layer, not just at compile time through crate dependencies, but at the reasoning layer before any code is written.
 
@@ -443,7 +468,9 @@ Implementations are registered by the binary crate, not by the kernel.
 
 ### 7.4 The AGENTS.md Hierarchy
 
-The root `AGENTS.md` sets project-wide policy. Crate-level `AGENTS.md` files narrow that policy for their specific scope. When an AI tool reads a file in `crates/zeroclaw-api/`, it should read both the root `AGENTS.md` (project policy) and `crates/zeroclaw-api/AGENTS.md` (crate policy). Crate policy is more specific and takes precedence where they conflict.
+The root `AGENTS.md` sets the compact project-wide policy. The [architecture and contribution map](../contributing/architecture-map.md) routes tasks to maintained architecture, foundation, testing, security, and maintainer sources. [Coding agent guidelines](../contributing/agent-guidelines.md) provide detailed project-wide examples and registries that are useful on demand but are not part of the always-loaded bootstrap.
+
+Crate-level `AGENTS.md` files narrow that policy for their specific scope. When an AI tool reads a file in `crates/zeroclaw-api/`, it should read the root contract, follow the architecture map for the task, and read `crates/zeroclaw-api/AGENTS.md` when present. Crate policy is more specific and takes precedence within its scope, but it cannot weaken project-wide safety, privacy, or authorization requirements.
 
 ---
 

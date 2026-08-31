@@ -1,5 +1,6 @@
 use crate::cmd::mdbook::refs::{build_api, build_refs};
 use crate::util::*;
+use anyhow::Context as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -13,7 +14,6 @@ pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
     ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
 
-    build_refs(&root)?;
     build_api(&root)?;
     build_locales(&root, tag)?;
     crate::cmd::mdbook::linkcheck::check_internal_links(&root, tag.unwrap_or(DEFAULT_TAG))?;
@@ -40,12 +40,7 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
             .collect::<Vec<_>>()
             .join(" ")
     );
-    inject_lang_switcher_locales(&book, &entries)?;
-    crate::cmd::mdbook::themes::run(root)?;
-    crate::cmd::mdbook::keymap::run(root)?;
-    crate::cmd::mdbook::hardware::run(root)?;
-    crate::cmd::mdbook::feature_matrix::run(root)?;
-    crate::cmd::mdbook::plugins::run(root)?;
+    prepare_generated_book_inputs(root, &entries)?;
     let mdbook = mdbook_program()?;
     let preprocessor_env = peer_groups_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
@@ -67,6 +62,26 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
+/// Generate every gitignored input that mdBook sources or hashes while
+/// rendering. Keep all entrypoints on this helper so a warm working tree cannot
+/// hide a missing generator from clean-checkout builds.
+pub fn prepare_generated_book_inputs(root: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
+    build_refs(root)?;
+    inject_lang_switcher_locales(&book_dir(root), entries)?;
+    crate::cmd::mdbook::themes::run(root)?;
+    crate::cmd::mdbook::keymap::run(root)?;
+    crate::cmd::mdbook::hardware::run(root)?;
+    crate::cmd::mdbook::feature_matrix::run(root)?;
+    crate::cmd::mdbook::plugins::run(root)?;
+    Ok(())
+}
+
+/// Render `theme/lang-switcher.js.tpl` into `theme/lang-switcher.js` with the
+/// `LOCALES` array filled from `locales.toml`. The `.js` output is gitignored
+/// (every locale add/remove rewrites it); the `.tpl` source is the tracked
+/// truth. Errors loudly when the template is missing — silently skipping
+/// would let mdBook fail later with a confusing "missing additional-js"
+/// message.
 pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
     let tpl_path = book.join("theme/lang-switcher.js.tpl");
     let js_path = book.join("theme/lang-switcher.js");
@@ -234,11 +249,20 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
             if !prefixes.iter().any(|p| rel_str.starts_with(p)) {
                 continue;
             }
-            let file_name = file.file_name().unwrap().to_string_lossy();
+            let file_name = file
+                .file_name()
+                .with_context(|| format!("asset path has no file name: {}", file.display()))?
+                .to_string_lossy();
             if let Some(unhashed_name) = strip_chrome_hash(&file_name) {
-                let dest_rel = rel.parent().unwrap().join(unhashed_name);
+                let dest_rel = rel
+                    .parent()
+                    .with_context(|| format!("asset path has no parent: {}", rel.display()))?
+                    .join(unhashed_name);
                 let dest = shared_dir.join(&dest_rel);
-                std::fs::create_dir_all(dest.parent().unwrap())?;
+                let dest_parent = dest.parent().with_context(|| {
+                    format!("shared asset destination has no parent: {}", dest.display())
+                })?;
+                std::fs::create_dir_all(dest_parent)?;
                 std::fs::copy(&file, &dest)?;
                 let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
                 // Store (locale-relative hashed path, unhashed shared-relative path).

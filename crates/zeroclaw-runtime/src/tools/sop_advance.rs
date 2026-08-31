@@ -153,6 +153,9 @@ impl Tool for SopAdvanceTool {
                 output: output.to_string(),
                 started_at: now.clone(),
                 completed_at: Some(now),
+                // Agent-reported advance of the current inline step; the tool
+                // has no resolved alias context of its own.
+                effective_agent: None,
                 tool_calls: Vec::new(),
             };
             let step_result_clone = step_result.clone();
@@ -162,6 +165,7 @@ impl Tool for SopAdvanceTool {
                     // Snapshot finished run for audit (Completed/Failed/Cancelled)
                     let finished = match &action {
                         SopRunAction::Completed { run_id, .. }
+                        | SopRunAction::Cancelled { run_id, .. }
                         | SopRunAction::Failed { run_id, .. } => engine.get_run(run_id).cloned(),
                         _ => None,
                     };
@@ -230,6 +234,9 @@ impl Tool for SopAdvanceTool {
                     }
                     SopRunAction::Completed { run_id, sop_name } => {
                         format!("SOP '{sop_name}' run {run_id} completed successfully.")
+                    }
+                    SopRunAction::Cancelled { run_id, sop_name } => {
+                        format!("SOP '{sop_name}' run {run_id} was cancelled.")
                     }
                     SopRunAction::Failed {
                         run_id,
@@ -318,6 +325,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }
     }

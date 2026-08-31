@@ -17,6 +17,7 @@ zeroclaw-infra.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
+cap-std = "4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false }
@@ -52,13 +53,26 @@ rustls-pki-types = "1.14.0"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1.0.6"
 
+# `O_NONBLOCK` for the MCP custom-CA loader, so a special file substituted at a
+# configured `tls_ca_cert_path` cannot block MCP registry startup.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 browser-native = ["dep:fantoccini"]
 probe = ["dep:probe-rs"]
+# Exposes cross-crate test-only constructors (e.g.
+# `McpRegistry::for_test_with_server_count`) so downstream test
+# suites can build registry fixtures without spawning real stdio
+# children. Intentionally not part of the default surface — the
+# constructors panic on real use and exist purely to keep
+# daemon-side tests self-contained.
+test-helpers = []
 
 [dev-dependencies]
 zeroclaw-infra.workspace = true
+rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"

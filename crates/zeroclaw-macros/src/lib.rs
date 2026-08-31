@@ -13,7 +13,7 @@ fn is_compound_type(ty: &syn::Type) -> bool {
     let Some(ident) = type_path.path.segments.last().map(|s| &s.ident) else {
         return false;
     };
-    ident == "Vec" || ident == "HashMap" || ident == "PathBuf"
+    ident == "Vec" || ident == "HashMap"
 }
 
 /// Check if any `#[serde(...)]` attribute on the field contains `skip`.
@@ -25,8 +25,23 @@ fn has_serde_flatten(field: &syn::Field) -> bool {
     has_serde_meta(field, "flatten")
 }
 
+/// Check if any `#[serde(...)]` attribute on the field contains `default`
+/// (bare `default` or `default = "fn"`).
+fn has_serde_default(field: &syn::Field) -> bool {
+    has_serde_meta(field, "default")
+}
+
 fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
-    for attr in &field.attrs {
+    attrs_have_serde_meta(&field.attrs, ident)
+}
+
+/// Check if any `#[serde(...)]` attribute in `attrs` contains `ident`
+/// (bare `ident` or `ident = "fn"`). Shared by field-level checks
+/// (`has_serde_meta`) and struct/container-level checks (e.g. a struct
+/// carrying `#[serde(default)]` on itself, which makes all its fields
+/// optional at deserialize time regardless of their own attributes).
+fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
+    for attr in attrs {
         if attr.path().is_ident("serde")
             && let Ok(nested) = attr.parse_args_with(
                 syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
@@ -134,7 +149,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let prefix = extract_prefix(&input);
     let category = derive_category(&prefix);
-    let integration_descriptor_method = build_integration_descriptor_method(&input.attrs);
+    let integration_descriptor_method = match build_integration_descriptor_method(&input.attrs) {
+        Ok(method) => method,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
@@ -473,10 +491,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             self.#field_ident.keys().map(String::as_str),
                         ) {
                             let hm_key = hm_key.to_string();
-                            if let Some(inner) = self.#field_ident.get_mut(&hm_key)
-                                && let Ok(()) = inner.set_prop(&inner_name, value_str)
-                            {
-                                return Ok(());
+                            if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                return inner.set_prop(&inner_name, value_str);
                             }
                         }
                     });
@@ -601,6 +617,16 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+                    // Dotted outer keys make candidate splits ambiguous, so an
+                    // inner "Unknown property" must `continue` to the next
+                    // (shorter) outer-key split — mirroring get_prop's retry
+                    // loop above — while real value errors return (via
+                    // `crate::config::is_unknown_property_error`).
+                    let double_map_set_gate = build_set_prop_delegation_gate(
+                        quote! { inner.set_prop(&inner_name, value_str) },
+                        quote! { &inner_name },
+                        quote! { continue; },
+                    );
                     nested_set_prop.push(quote! {
                         {
                             let path_prefix = if Self::configurable_prefix().is_empty() {
@@ -636,9 +662,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                     };
                                     if let Some(inner_map) = self.#field_ident.get_mut(&outer_key)
                                         && let Some(inner) = inner_map.get_mut(&inner_key)
-                                        && inner.set_prop(&inner_name, value_str).is_ok()
                                     {
-                                        return Ok(());
+                                        #double_map_set_gate
                                     }
                                 }
                             }
@@ -904,10 +929,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             self.#field_ident.keys().map(String::as_str),
                         ) {
                             let hm_key = hm_key.to_string();
-                            if let Some(inner) = self.#field_ident.get_mut(&hm_key)
-                                && let Ok(()) = inner.set_prop(&inner_name, value_str)
-                            {
-                                return Ok(());
+                            if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                return inner.set_prop(&inner_name, value_str);
                             }
                         }
                     });
@@ -1127,11 +1150,21 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     }
                 });
+                // Option<T> nested fields delegate with the UNSTRIPPED name
+                // (T carries its own configurable_prefix), so the namespace is
+                // shared with sibling fields: an inner "Unknown property"
+                // falls through so siblings still get their chance, while
+                // real value errors propagate — see
+                // `build_set_prop_delegation_gate` /
+                // `crate::config::is_unknown_property_error`.
+                let option_set_gate = build_set_prop_delegation_gate(
+                    quote! { inner.set_prop(name, value_str) },
+                    quote! { name },
+                    quote! {},
+                );
                 nested_set_prop.push(quote! {
                     if let Some(inner) = &mut self.#field_ident {
-                        if let Ok(()) = inner.set_prop(name, value_str) {
-                            return Ok(());
-                        }
+                        #option_set_gate
                     }
                 });
                 nested_prop_is_secret.push(quote! {
@@ -1148,7 +1181,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             let dominated = prefix.map_or(true, |p| {
                                 child_prefix.starts_with(p) || p.starts_with(child_prefix)
                             });
-                            if dominated {
+                            let explicitly_targeted = prefix.is_some_and(|p| p.starts_with(child_prefix));
+                            if dominated
+                                && (explicitly_targeted
+                                    || !<#inner_ty_tokens>::init_requires_explicit_config())
+                            {
                                 let mut probe = <#inner_ty_tokens as Default>::default();
                                 let child_results = probe.init_defaults(prefix);
                                 initialized.push(child_prefix);
@@ -1665,6 +1702,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+                    // Flattened fields share this struct's dotted namespace,
+                    // so an inner "Unknown property" falls through — sibling
+                    // own-fields and the generic leaf fallback must still get
+                    // their chance — while real value errors propagate
+                    // — see `build_set_prop_delegation_gate` /
+                    // `crate::config::is_unknown_property_error`.
+                    let flatten_set_gate = build_set_prop_delegation_gate(
+                        quote! { self.#field_ident.set_prop(&inner_name, value_str) },
+                        quote! { &inner_name },
+                        quote! {},
+                    );
                     nested_set_prop.push(quote! {
                         {
                             let outer_prefix = Self::configurable_prefix();
@@ -1680,9 +1728,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 } else {
                                     format!("{inner_prefix}.{leaf}")
                                 };
-                                if let Ok(()) = self.#field_ident.set_prop(&inner_name, value_str) {
-                                    return Ok(());
-                                }
+                                #flatten_set_gate
                             }
                         }
                     });
@@ -1998,11 +2044,46 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let prefix_lit = &prefix;
 
+    // True when this struct has a required leaf field that would break a
+    // scaffolded round-trip: a non-`#[nested]`, non-`Option<_>` field with
+    // no `#[serde(skip...)]`/`#[serde(flatten)]`/`#[serde(default...)]`,
+    // and the struct itself doesn't carry a container-level
+    // `#[serde(default)]` (which would make every field optional at
+    // deserialize time regardless of the field's own attributes).
+    //
+    // Used by `init_defaults` to gate whether a `#[nested] Option<T>`
+    // field may be scaffolded from `T::default()` when the caller did not
+    // explicitly target this section: scaffolding a struct like this
+    // fills the required field with its Rust `Default` (typically `""`
+    // for `String`), which `prune_empty_leaves` then strips on save,
+    // leaving a partial sub-table that fails strict reload. The scaffold
+    // site that consumes this flag is the `init_defaults_ops` gate above.
+    let init_requires_explicit_config: bool = !attrs_have_serde_meta(&input.attrs, "default")
+        && fields.iter().any(|f| {
+            !has_attr(f, "nested")
+                && !has_serde_skip(f)
+                && !has_serde_flatten(f)
+                && extract_option_inner(&f.ty).is_none()
+                && !has_serde_default(f)
+        });
+
     let expanded = quote! {
         impl #struct_name {
             /// Returns the `#[prefix]` value for this Configurable struct.
             pub fn configurable_prefix() -> &'static str {
                 #prefix_lit
+            }
+
+            /// True when this struct has a required leaf field that a
+            /// bare/ancestor-prefix `init_defaults` scaffold must not
+            /// materialize (it would fill the field with its Rust
+            /// `Default`, which `prune_empty_leaves` then strips on save,
+            /// leaving a partial sub-table that fails strict reload).
+            /// Explicitly targeting this section (or a descendant of it)
+            /// still scaffolds regardless of this flag, so the section can
+            /// be materialized for the operator to fill in.
+            pub fn init_requires_explicit_config() -> bool {
+                #init_requires_explicit_config
             }
 
             #integration_descriptor_method
@@ -2599,11 +2680,42 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
     })
 }
 
-fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
+/// Shared `set_prop` delegation gate for nested sites whose dotted namespace
+/// is (or may be) shared with sibling candidates: serde-flatten fields,
+/// `Option<T>` nested fields, and the two-level dotted-key candidate loop.
+/// `Ok` and real value errors return immediately — the path is
+/// confirmed, so a failure is a value problem that must reach the caller.
+/// The generated "Unknown property" marker
+/// (`crate::config::is_unknown_property_error`) instead means "not one of
+/// mine": the site-specific `on_unknown` tokens run so the next candidate —
+/// a sibling field, the generic leaf fallback, or the next dotted-key split —
+/// still gets its chance.
+///
+/// `attempted_name` must be the exact `&str` expression for the property
+/// name passed into `call`'s nested `set_prop` — `is_unknown_property_error`
+/// compares against that exact name so a value error whose message merely
+/// starts with "Unknown property" isn't mistaken for the fall-through
+/// marker.
+fn build_set_prop_delegation_gate(
+    call: proc_macro2::TokenStream,
+    attempted_name: proc_macro2::TokenStream,
+    on_unknown: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    quote! {
+        match #call {
+            Err(e) if crate::config::is_unknown_property_error(&e, #attempted_name) => { #on_unknown }
+            other => return other,
+        }
+    }
+}
+
+fn build_integration_descriptor_method(
+    attrs: &[syn::Attribute],
+) -> syn::Result<proc_macro2::TokenStream> {
     let mut category: Option<String> = None;
     let mut display_name: Option<String> = None;
     let mut description: Option<String> = None;
-    let mut status_field: Option<String> = None;
+    let mut status_field: Option<syn::LitStr> = None;
     let mut found = false;
 
     for attr in attrs {
@@ -2625,34 +2737,34 @@ fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2:
             };
             let value = match &meta.value {
                 syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
-                    Lit::Str(s) => s.value(),
+                    Lit::Str(s) => s,
                     _ => continue,
                 },
                 _ => continue,
             };
             match key.as_str() {
-                "category" => category = Some(value),
-                "display_name" => display_name = Some(value),
-                "description" => description = Some(value),
-                "status_field" => status_field = Some(value),
+                "category" => category = Some(value.value()),
+                "display_name" => display_name = Some(value.value()),
+                "description" => description = Some(value.value()),
+                "status_field" => status_field = Some(value.clone()),
                 _ => {}
             }
         }
     }
 
     if !found {
-        return proc_macro2::TokenStream::new();
+        return Ok(proc_macro2::TokenStream::new());
     }
 
     let category_lit = category.unwrap_or_default();
     let display_name_lit = display_name.unwrap_or_default();
     let description_lit = description.unwrap_or_default();
     let status_field_ident = match status_field {
-        Some(name) => syn::Ident::new(&name, proc_macro2::Span::call_site()),
+        Some(name) => name.parse::<syn::Ident>()?,
         None => syn::Ident::new("enabled", proc_macro2::Span::call_site()),
     };
 
-    quote! {
+    Ok(quote! {
         /// Auto-generated by `#[integration(...)]`. Returns the integration
         /// descriptor for this nested toggleable config so callers (e.g. the
         /// integrations registry) consume schema-side metadata instead of
@@ -2665,7 +2777,7 @@ fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2:
                 active: self.#status_field_ident,
             }
         }
-    }
+    })
 }
 
 /// Flatten a field's `///` doc comment into a single space-separated line.
@@ -2808,5 +2920,19 @@ mod tests {
             pub token: String
         };
         assert!(has_serde_skip(&field));
+    }
+
+    #[test]
+    fn integration_status_field_rejects_invalid_identifier() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "not-valid"
+            )]
+        }];
+
+        assert!(build_integration_descriptor_method(&attrs).is_err());
     }
 }

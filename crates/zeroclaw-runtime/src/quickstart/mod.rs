@@ -8,6 +8,7 @@ use zeroclaw_config::presets::{
     SelectorChoice, recommended_runtime_preset, risk_preset, runtime_preset,
 };
 use zeroclaw_config::schema::{Config, WireApi};
+use zeroclaw_config::traits::AliasSource;
 
 /// Which surface invoked the Quickstart. Stamped on every event in
 /// the apply path so SSE/dashboard consumers can filter by origin
@@ -526,12 +527,7 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
         default_runtime_profile: recommended_runtime_preset(None)
             .map(|preset| preset.preset_name.to_string())
             .unwrap_or_default(),
-        model_providers: cfg
-            .providers
-            .models
-            .iter_entries()
-            .map(|(family, alias, _)| format!("{family}.{alias}"))
-            .collect(),
+        model_providers: cfg.resolve_alias_source(AliasSource::ModelProviders),
         channels: collect_aliased_refs(&cfg.channels),
         unassigned_channels: collect_aliased_refs(&cfg.channels)
             .into_iter()
@@ -589,6 +585,31 @@ fn build_channel_type_options(
             default_runtime_profile: None,
         })
         .collect()
+}
+
+fn resolve_channel_quickstart_type(channel_type: &str) -> (&str, bool) {
+    match channel_type {
+        "whatsapp-web" | "whatsapp_web" => ("whatsapp", true),
+        other => (other, false),
+    }
+}
+
+fn canonical_quickstart_channel_ref(reference: &str) -> Option<String> {
+    let (channel_type, alias) = split_ref(reference.trim())?;
+    let (config_channel_type, _) = resolve_channel_quickstart_type(channel_type);
+    Some(format!("{config_channel_type}.{alias}"))
+}
+
+fn default_whatsapp_web_session_path(config: &Config, alias: &str) -> String {
+    config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("state")
+        .join("whatsapp-web")
+        .join(format!("{alias}.db"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Walk the serialised form of `value` and yield `<type>.<alias>` refs
@@ -668,7 +689,14 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
                 codex_auth_preselected,
             )
         }
-        FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS, false),
+        FieldSection::Channel => {
+            let essentials = if type_key == "webhook" {
+                WEBHOOK_CHANNEL_ESSENTIALS
+            } else {
+                CHANNEL_ESSENTIALS
+            };
+            (format!("channels.{type_key}"), essentials, false)
+        }
         FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS, false),
     };
 
@@ -692,7 +720,9 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
         if !essentials.contains(&field_path) {
             continue;
         }
-        let default = if info.is_secret {
+        let default = if section_path == "channels.webhook" && field_path == "port" {
+            Some(zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT.to_string())
+        } else if info.is_secret {
             None
         } else {
             let raw = info.display_value.trim();
@@ -746,6 +776,14 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
 /// without.
 const MODEL_PROVIDER_ESSENTIALS: &[&str] = &["model", QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri"];
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
+const WEBHOOK_CHANNEL_ESSENTIALS: &[&str] = &[
+    "bot_token",
+    "token",
+    "webhook_url",
+    "allowed_users",
+    "port",
+    "secret",
+];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
 const QUICKSTART_AUTH_MODE_FIELD: &str = "auth_mode";
@@ -1398,6 +1436,11 @@ fn apply_memory(
 
 // ── Channels ───────────────────────────────────────────────────────
 
+fn usable_quickstart_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!zeroclaw_config::traits::is_unset_display_value(value)).then_some(value)
+}
+
 fn apply_channels(
     config: &mut Config,
     channels: &[SelectorChoice<ChannelQuickStart>],
@@ -1434,6 +1477,11 @@ fn apply_channels(
                         ));
                         continue;
                     }
+                    if family == "webhook"
+                        && !validate_enabled_webhook_port(config, alias, idx, errors, ctx)
+                    {
+                        continue;
+                    }
                     refs.push(reference.clone());
                 } else {
                     errors.push(QuickstartError::for_surface(
@@ -1447,7 +1495,9 @@ fn apply_channels(
                 }
             }
             SelectorChoice::Fresh(entry) => {
-                if entry.channel_type.trim().is_empty() || entry.alias.trim().is_empty() {
+                let submitted_channel_type = entry.channel_type.trim();
+                let alias = entry.alias.trim();
+                if submitted_channel_type.is_empty() || alias.is_empty() {
                     errors.push(QuickstartError::for_surface(
                         ctx,
                         QuickstartStep::Channels,
@@ -1458,8 +1508,10 @@ fn apply_channels(
                     ));
                     continue;
                 }
-                if channel_exists(config, &entry.channel_type, &entry.alias) {
-                    let alias_ref = format!("{}.{}", entry.channel_type, entry.alias);
+                let (config_channel_type, is_whatsapp_web) =
+                    resolve_channel_quickstart_type(submitted_channel_type);
+                if channel_exists(config, config_channel_type, alias) {
+                    let alias_ref = format!("{config_channel_type}.{alias}");
                     errors.push(QuickstartError::for_surface(
                         ctx,
                         QuickstartStep::Channels,
@@ -1470,8 +1522,47 @@ fn apply_channels(
                     ));
                     continue;
                 }
+                let advertised: std::collections::HashSet<String> =
+                    field_shape(FieldSection::Channel, &entry.channel_type)
+                        .into_iter()
+                        .map(|field| field.key)
+                        .collect();
+                if let Some(key) = entry
+                    .fields
+                    .keys()
+                    .filter(|key| !advertised.contains(*key))
+                    .min()
+                {
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.{key}"),
+                        format!("channel field `{key}` is not available in Quickstart"),
+                        "cli-quickstart-error-channel-field-not-advertised",
+                        &[("field", key.as_str())],
+                    ));
+                    continue;
+                }
+                if config_channel_type == "webhook"
+                    && entry
+                        .fields
+                        .get("secret")
+                        .and_then(|value| usable_quickstart_value(value))
+                        .is_none()
+                {
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.secret"),
+                        "webhook secret is required",
+                        "cli-quickstart-error-webhook-secret-required",
+                        &[],
+                    ));
+                    continue;
+                }
+                let mut staged = config.clone();
                 if let Err(err) =
-                    config.create_map_key(&format!("channels.{}", entry.channel_type), &entry.alias)
+                    staged.create_map_key(&format!("channels.{config_channel_type}"), alias)
                 {
                     errors.push(QuickstartError::new(
                         QuickstartStep::Channels,
@@ -1480,34 +1571,126 @@ fn apply_channels(
                     ));
                     continue;
                 }
-                let token_path =
-                    format!("channels.{}.{}.bot_token", entry.channel_type, entry.alias);
-                if let Some(tok) = &entry.token {
-                    if let Err(err) = config.set_prop_persistent(&token_path, tok) {
+                let prefix = format!("channels.{config_channel_type}.{alias}");
+                if config_channel_type == "webhook"
+                    && entry
+                        .fields
+                        .get("port")
+                        .and_then(|value| usable_quickstart_value(value))
+                        .is_none()
+                    && let Err(err) = staged.set_prop_persistent(
+                        &format!("{prefix}.port"),
+                        &zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT.to_string(),
+                    )
+                {
+                    errors.push(QuickstartError::new(
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.port"),
+                        err.to_string(),
+                    ));
+                    continue;
+                }
+                let mut fields: Vec<_> = entry
+                    .fields
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        usable_quickstart_value(value).map(|value| (key, value))
+                    })
+                    .collect();
+                fields.sort_by_key(|(left, _)| *left);
+
+                let mut failed = false;
+                for (key, value) in fields {
+                    if let Err(err) = staged.set_prop_persistent(&format!("{prefix}.{key}"), value)
+                    {
                         errors.push(QuickstartError::new(
                             QuickstartStep::Channels,
-                            format!("channels[{idx}].token"),
+                            format!("channels[{idx}].fields.{key}"),
                             err.to_string(),
                         ));
-                        continue;
-                    }
-                } else {
-                    // No creds — still need to materialize the entry so the agent
-                    // record can reference it. Set `enabled = true` as the minimum
-                    // schema-recognised field; channels without creds will fail
-                    // their own bootstrap loudly, which is the desired behaviour.
-                    let enabled_path =
-                        format!("channels.{}.{}.enabled", entry.channel_type, entry.alias);
-                    if let Err(err) = config.set_prop_persistent(&enabled_path, "true") {
-                        errors.push(QuickstartError::new(
-                            QuickstartStep::Channels,
-                            format!("channels[{idx}]"),
-                            err.to_string(),
-                        ));
-                        continue;
+                        failed = true;
+                        break;
                     }
                 }
-                refs.push(format!("{}.{}", entry.channel_type, entry.alias));
+                if !failed && is_whatsapp_web {
+                    let default_path = default_whatsapp_web_session_path(config, alias);
+                    if let Err(err) =
+                        staged.set_prop_persistent(&format!("{prefix}.session_path"), &default_path)
+                    {
+                        errors.push(QuickstartError::new(
+                            QuickstartStep::Channels,
+                            format!("channels[{idx}].channel_type"),
+                            err.to_string(),
+                        ));
+                        failed = true;
+                    }
+                }
+                if !failed
+                    && let Err(err) =
+                        staged.set_prop_persistent(&format!("{prefix}.enabled"), "true")
+                {
+                    errors.push(QuickstartError::new(
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.enabled"),
+                        err.to_string(),
+                    ));
+                    failed = true;
+                }
+                if !failed
+                    && config_channel_type == "webhook"
+                    && !validate_enabled_webhook_port(&staged, alias, idx, errors, ctx)
+                {
+                    failed = true;
+                }
+                if !failed
+                    && config_channel_type == "telegram"
+                    && let Some(telegram) = staged.channels.telegram.get(alias)
+                    && let Err(err) = telegram.validate_bot_token(alias)
+                {
+                    let structured =
+                        zeroclaw_config::api_error::ConfigApiError::from_validation(err);
+                    let terminal = structured
+                        .path
+                        .as_deref()
+                        .and_then(|path| path.rsplit('.').next())
+                        .unwrap_or("credential");
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.{terminal}"),
+                        structured.message,
+                        "cli-quickstart-error-channel-token-required",
+                        &[],
+                    ));
+                    failed = true;
+                }
+                if !failed
+                    && config_channel_type == "discord"
+                    && let Some(discord) = staged.channels.discord.get(alias)
+                    && let Err(err) = discord.validate_bot_token(alias)
+                {
+                    let structured =
+                        zeroclaw_config::api_error::ConfigApiError::from_validation(err);
+                    let terminal = structured
+                        .path
+                        .as_deref()
+                        .and_then(|path| path.rsplit('.').next())
+                        .unwrap_or("credential");
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.{terminal}"),
+                        structured.message,
+                        "cli-quickstart-error-channel-token-required",
+                        &[],
+                    ));
+                    failed = true;
+                }
+                if failed {
+                    continue;
+                }
+                *config = staged;
+                refs.push(format!("{config_channel_type}.{alias}"));
             }
         }
     }
@@ -1517,6 +1700,72 @@ fn apply_channels(
 fn channel_exists(config: &Config, channel_type: &str, alias: &str) -> bool {
     let probe = format!("channels.{channel_type}.{alias}.enabled");
     config.get_prop(&probe).is_ok()
+}
+
+/// Validate one enabled webhook selection against the complete staged config.
+///
+/// Both fresh and existing selectors pass through this boundary so choosing a
+/// preconfigured webhook cannot bypass the same-port rule enforced while a new
+/// alias is staged. Returns `true` for disabled aliases because they do not
+/// start listeners.
+fn validate_enabled_webhook_port(
+    config: &Config,
+    alias: &str,
+    index: usize,
+    errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
+) -> bool {
+    let Some(webhook) = config.channels.webhook.get(alias) else {
+        return true;
+    };
+    if !webhook.enabled {
+        return true;
+    }
+    let port = webhook.port;
+    let Some(other) = conflicting_enabled_webhook_alias(config, alias, port).map(str::to_string)
+    else {
+        return true;
+    };
+    let port_text = port.to_string();
+    errors.push(QuickstartError::for_surface(
+        ctx,
+        QuickstartStep::Channels,
+        format!("channels[{index}].fields.port"),
+        format!(
+            "webhook port {port_text} is already used by enabled webhook `{other}` — each enabled webhook needs its own port"
+        ),
+        "cli-quickstart-error-webhook-port-conflict",
+        &[("port", port_text.as_str()), ("alias", other.as_str())],
+    ));
+    false
+}
+
+/// Find an already-enabled webhook alias that would claim `port`.
+///
+/// The webhook listener binds `0.0.0.0:<port>` — [`WebhookConfig`] has no
+/// host/interface knob — so the port alone identifies the listen address and
+/// two enabled aliases sharing one are guaranteed to collide at bind time.
+/// Disabled aliases never start a listener, so they never conflict.
+///
+/// `config` here is the *staged* post-apply config, so this sees both aliases
+/// already persisted and the fresh aliases staged earlier in the same
+/// submission. `alias` (the entry being validated) is skipped so an entry
+/// never conflicts with itself. Matches are minimised by alias name to keep
+/// the reported conflict stable across `HashMap` iteration order.
+fn conflicting_enabled_webhook_alias<'a>(
+    config: &'a Config,
+    alias: &str,
+    port: u16,
+) -> Option<&'a str> {
+    config
+        .channels
+        .webhook
+        .iter()
+        .filter(|(other, webhook)| {
+            other.as_str() != alias && webhook.enabled && webhook.port == port
+        })
+        .map(|(other, _)| other.as_str())
+        .min()
 }
 
 // ── Peer groups ────────────────────────────────────────────────────
@@ -1552,10 +1801,21 @@ fn apply_peer_groups(
             ));
             continue;
         }
+        let Some(channel_ref) = canonical_quickstart_channel_ref(&pg.channel) else {
+            errors.push(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Channels,
+                format!("peer_groups[{idx}].channel"),
+                format!("`{}` is not a `<type>.<alias>` reference", pg.channel),
+                "cli-quickstart-error-not-type-alias-ref",
+                &[("reference", &pg.channel)],
+            ));
+            continue;
+        };
         // Channel ref must resolve to either a channel already in config
         // OR a channel staged in this same submission.
-        let staged_match = staged_channel_refs.iter().any(|r| r == &pg.channel);
-        let configured_match = match split_ref(&pg.channel) {
+        let staged_match = staged_channel_refs.iter().any(|r| r == &channel_ref);
+        let configured_match = match split_ref(&channel_ref) {
             Some((family, alias)) => channel_exists(config, family, alias),
             None => false,
         };
@@ -1595,7 +1855,7 @@ fn apply_peer_groups(
             continue;
         }
         let prefix = format!("peer_groups.{}", pg.name);
-        if let Err(err) = config.set_prop_persistent(&format!("{prefix}.channel"), &pg.channel) {
+        if let Err(err) = config.set_prop_persistent(&format!("{prefix}.channel"), &channel_ref) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].channel"),
@@ -2085,6 +2345,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn snapshot_state_sorts_configured_model_provider_refs() {
+        let mut cfg = Config::default();
+        cfg.create_map_key("providers.models.openai", "zeta")
+            .unwrap();
+        cfg.create_map_key("providers.models.anthropic", "omega")
+            .unwrap();
+        cfg.create_map_key("providers.models.anthropic", "alpha")
+            .unwrap();
+
+        let snapshot = snapshot_state(&cfg);
+
+        assert_eq!(
+            snapshot.model_providers,
+            vec![
+                "anthropic.alpha".to_string(),
+                "anthropic.omega".to_string(),
+                "openai.zeta".to_string(),
+            ]
+        );
+    }
+
     fn fresh_submission(agent_name: &str) -> BuilderSubmission {
         BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
@@ -2107,6 +2389,21 @@ mod tests {
                 personality_file: None,
                 personality_files: vec![],
             },
+        }
+    }
+
+    fn fresh_channel(
+        channel_type: &str,
+        alias: &str,
+        fields: &[(&str, &str)],
+    ) -> ChannelQuickStart {
+        ChannelQuickStart {
+            channel_type: channel_type.into(),
+            alias: alias.into(),
+            fields: fields
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
         }
     }
 
@@ -2556,6 +2853,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn webhook_channel_quickstart_fields_include_port_and_secret() {
+        let rows = super::field_shape(super::FieldSection::Channel, "webhook");
+        let port = rows
+            .iter()
+            .find(|row| row.key == "port")
+            .expect("webhook port row");
+        assert_eq!(port.default.as_deref(), Some("8090"));
+        assert!(port.required);
+        assert!(!port.is_secret);
+
+        let secret = rows
+            .iter()
+            .find(|row| row.key == "secret")
+            .expect("webhook secret row");
+        assert!(secret.required);
+        assert!(secret.is_secret);
+        assert_eq!(secret.default, None);
+    }
+
+    #[test]
+    fn non_webhook_channel_quickstart_fields_exclude_webhook_requirements() {
+        for channel_type in ["irc", "lark"] {
+            let rows = super::field_shape(super::FieldSection::Channel, channel_type);
+            assert!(
+                rows.iter()
+                    .all(|row| row.key != "port" && row.key != "secret"),
+                "{channel_type} must not inherit webhook-only fields; got {rows:?}"
+            );
+        }
+    }
+
     async fn apply_to_temp(submission: BuilderSubmission) -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
@@ -2644,16 +2973,8 @@ mod tests {
     async fn multiple_channels_all_bind_to_agent() {
         let mut submission = fresh_submission("bot");
         submission.channels = vec![
-            SelectorChoice::Fresh(ChannelQuickStart {
-                channel_type: "telegram".into(),
-                alias: "tg".into(),
-                token: Some("tok-a".into()),
-            }),
-            SelectorChoice::Fresh(ChannelQuickStart {
-                channel_type: "discord".into(),
-                alias: "dc".into(),
-                token: Some("tok-b".into()),
-            }),
+            SelectorChoice::Fresh(fresh_channel("telegram", "tg", &[("bot_token", "tok-a")])),
+            SelectorChoice::Fresh(fresh_channel("discord", "dc", &[("bot_token", "tok-b")])),
         ];
         let (dir, _applied) = apply_to_temp(submission).await;
         let reloaded = reload(&dir);
@@ -2668,16 +2989,567 @@ mod tests {
             "second channel must also be bound; got {bound:?}"
         );
         assert_eq!(bound.len(), 2, "both channels bound, not just the last");
+        let store = zeroclaw_config::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(
+            store
+                .decrypt(&reloaded.channels.telegram["tg"].bot_token)
+                .unwrap(),
+            "tok-a"
+        );
+        assert!(reloaded.channels.telegram["tg"].enabled);
+        assert_eq!(
+            store
+                .decrypt(&reloaded.channels.discord["dc"].bot_token)
+                .unwrap(),
+            "tok-b"
+        );
+        assert!(reloaded.channels.discord["dc"].enabled);
+    }
+
+    #[tokio::test]
+    async fn telegram_channel_fields_persist_canonical_bot_token() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "telegram",
+            "ops",
+            &[("bot_token", " 123:ABC ")],
+        ))];
+
+        let (dir, _) = apply_to_temp(submission).await;
+        let reloaded = reload(&dir);
+        let store = zeroclaw_config::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(
+            store
+                .decrypt(&reloaded.channels.telegram["ops"].bot_token)
+                .unwrap(),
+            "123:ABC"
+        );
+        assert!(reloaded.channels.telegram["ops"].enabled);
+    }
+
+    #[tokio::test]
+    async fn webhook_channel_quickstart_fields_persist() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("port", "9191"), ("secret", "shared-secret")],
+        ))];
+
+        let (dir, _) = apply_to_temp(submission).await;
+        let reloaded = reload(&dir);
+        let webhook = &reloaded.channels.webhook["inbound"];
+        assert_eq!(webhook.port, 9191);
+        assert!(webhook.enabled);
+
+        let stored_secret = webhook.secret.as_deref().expect("persisted webhook secret");
+        assert!(zeroclaw_config::secrets::SecretStore::is_encrypted(
+            stored_secret
+        ));
+        let store = zeroclaw_config::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(store.decrypt(stored_secret).unwrap(), "shared-secret");
+    }
+
+    #[test]
+    fn webhook_channel_defaults_port_and_rejects_unusable_secret() {
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(zeroclaw_config::traits::UNSET_DISPLAY),
+        ] {
+            let mut cfg = Config::default();
+            let fields = value.map_or_else(Vec::new, |value| vec![("secret", value)]);
+            let channels = vec![SelectorChoice::Fresh(fresh_channel(
+                "webhook", "inbound", &fields,
+            ))];
+            let mut errors = Vec::new();
+
+            let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+            assert!(refs.is_empty());
+            assert!(errors.iter().any(|error| {
+                error.field == "channels[0].fields.secret" && error.message.contains("required")
+            }));
+            assert!(!cfg.channels.webhook.contains_key("inbound"));
+        }
+
+        let mut cfg = Config::default();
+        let channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "shared-secret")],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply errors: {errors:?}");
+        assert_eq!(refs, ["webhook.inbound"]);
+        assert_eq!(
+            cfg.channels.webhook["inbound"].port,
+            zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        );
+    }
+
+    /// Two enabled webhook aliases staged in one submission that both land on
+    /// the default port must be rejected: the orchestrator starts one listener
+    /// per alias and only one can bind `0.0.0.0:8090`.
+    #[test]
+    fn webhook_channel_rejects_duplicate_enabled_ports_within_submission() {
+        let mut cfg = Config::default();
+        let channels = vec![
+            SelectorChoice::Fresh(fresh_channel("webhook", "first", &[("secret", "secret-a")])),
+            SelectorChoice::Fresh(fresh_channel(
+                "webhook",
+                "second",
+                &[("secret", "secret-b")],
+            )),
+        ];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert_eq!(
+            refs,
+            ["webhook.first"],
+            "only the first alias may claim the default port"
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[1].fields.port"
+                    && error.message.contains("8090")
+                    && error.message.contains("first")
+            }),
+            "port conflict must be reported on the second entry's port field; got {errors:?}"
+        );
+        assert!(
+            !cfg.channels.webhook.contains_key("second"),
+            "conflicting alias must not be persisted"
+        );
+    }
+
+    /// The conflict check must also see aliases that already exist in the
+    /// config, not just the ones staged in this submission.
+    #[test]
+    fn webhook_channel_rejects_duplicate_enabled_port_against_existing_alias() {
+        let mut cfg = Config::default();
+        cfg.channels.webhook.insert(
+            "existing".into(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                ..Default::default()
+            },
+        );
+        let channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "shared-secret")],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(refs.is_empty(), "conflicting alias must not be bound");
+        assert!(
+            errors.iter().any(|error| {
+                error.field == "channels[0].fields.port" && error.message.contains("existing")
+            }),
+            "existing enabled alias must be reported as the conflict; got {errors:?}"
+        );
+        assert!(!cfg.channels.webhook.contains_key("inbound"));
+    }
+
+    #[test]
+    fn webhook_channel_rejects_existing_selection_with_duplicate_enabled_port() {
+        let mut cfg = Config::default();
+        for alias in ["already-active", "selected"] {
+            cfg.channels.webhook.insert(
+                alias.into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                    ..Default::default()
+                },
+            );
+        }
+        let before_dirty_paths = cfg.dirty_paths.clone();
+        let channels = vec![SelectorChoice::Existing("webhook.selected".into())];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(
+            refs.is_empty(),
+            "the conflicting existing alias must not be bound"
+        );
+        assert!(errors.iter().any(|error| {
+            error.field == "channels[0].fields.port"
+                && error.message.contains("8090")
+                && error.message.contains("already-active")
+        }));
+        assert_eq!(cfg.dirty_paths, before_dirty_paths);
+        assert_eq!(cfg.channels.webhook.len(), 2);
+        assert!(cfg.channels.webhook.values().all(|webhook| {
+            webhook.enabled && webhook.port == zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        }));
+    }
+
+    #[tokio::test]
+    async fn existing_webhook_conflict_preserves_saved_config_and_cli_field_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        for alias in ["already-active", "selected"] {
+            config.channels.webhook.insert(
+                alias.into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                    ..Default::default()
+                },
+            );
+        }
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Existing("webhook.selected".into())];
+
+        let errors = apply_with_surface(submission, &mut config, Surface::Cli)
+            .await
+            .expect_err("an existing same-port webhook must be rejected");
+
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.port"
+                    && error.message.contains("8090")
+                    && error.message.contains("already-active")
+            }),
+            "localized port conflict must preserve its field and parameters: {errors:?}"
+        );
+        let after = std::fs::read_to_string(&config.config_path).unwrap();
+        assert_eq!(
+            after, before,
+            "a rejected Quickstart apply must not rewrite config.toml"
+        );
+        let reloaded: Config = toml::from_str(&after).unwrap();
+        assert!(!reloaded.agents.contains_key("bot"));
+        assert_eq!(reloaded.channels.webhook.len(), 2);
+    }
+
+    /// A disabled webhook never starts a listener, so it must not block a new
+    /// alias from taking the same port.
+    #[test]
+    fn webhook_channel_allows_duplicate_port_when_existing_alias_is_disabled() {
+        let mut cfg = Config::default();
+        cfg.channels.webhook.insert(
+            "parked".into(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: false,
+                port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                ..Default::default()
+            },
+        );
+        let channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "shared-secret")],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply errors: {errors:?}");
+        assert_eq!(refs, ["webhook.inbound"]);
+        assert_eq!(
+            cfg.channels.webhook["inbound"].port,
+            zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        );
+    }
+
+    /// Distinct ports are the supported multi-webhook setup and must pass.
+    #[test]
+    fn webhook_channel_allows_distinct_enabled_ports() {
+        let mut cfg = Config::default();
+        let channels = vec![
+            SelectorChoice::Fresh(fresh_channel("webhook", "first", &[("secret", "secret-a")])),
+            SelectorChoice::Fresh(fresh_channel(
+                "webhook",
+                "second",
+                &[("port", "9191"), ("secret", "secret-b")],
+            )),
+        ];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply errors: {errors:?}");
+        assert_eq!(refs, ["webhook.first", "webhook.second"]);
+        assert_eq!(
+            cfg.channels.webhook["first"].port,
+            zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        );
+        assert_eq!(cfg.channels.webhook["second"].port, 9191);
+    }
+
+    #[test]
+    fn webhook_channel_cli_reports_webhook_port_conflict_error() {
+        let mut cfg = Config::default();
+        cfg.channels.webhook.insert(
+            "existing".into(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                ..Default::default()
+            },
+        );
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "shared-secret")],
+        ))];
+
+        let errors = validate_only_with_surface(&submission, &cfg, Surface::Cli)
+            .expect_err("duplicate enabled webhook port must be rejected");
+
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.port"
+                    && error.message.contains("8090")
+                    && error.message.contains("existing")
+            }),
+            "localized port conflict must preserve its field and parameters; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn webhook_channel_cli_reports_webhook_secret_error() {
+        let cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "")],
+        ))];
+
+        let errors = validate_only_with_surface(&submission, &cfg, Surface::Cli)
+            .expect_err("empty webhook secret must be rejected");
+
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.secret"
+                    && !error.message.trim().is_empty()
+            }),
+            "localized webhook secret validation must preserve its field: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn telegram_channel_fields_reject_unusable_bot_token_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(zeroclaw_config::traits::UNSET_DISPLAY),
+        ] {
+            let cfg = Config::default();
+            let mut submission = fresh_submission("bot");
+            let fields = value.map_or_else(Vec::new, |value| vec![("bot_token", value)]);
+            submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+                "telegram", "ops", &fields,
+            ))];
+
+            let errors = validate_only(&submission, &cfg).expect_err("token must be rejected");
+            assert!(errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.bot_token"
+                    && error.message.contains("required")
+            }));
+        }
+    }
+
+    #[test]
+    fn discord_channel_fields_reject_unusable_bot_token_values() {
+        // Discord twin of telegram_channel_fields_reject_unusable_bot_token_values:
+        // the quickstart arm calls DiscordConfig::validate_bot_token.
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(zeroclaw_config::traits::UNSET_DISPLAY),
+        ] {
+            let cfg = Config::default();
+            let mut submission = fresh_submission("bot");
+            let fields = value.map_or_else(Vec::new, |value| vec![("bot_token", value)]);
+            submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+                "discord", "ops", &fields,
+            ))];
+
+            let errors = validate_only(&submission, &cfg).expect_err("token must be rejected");
+            assert!(errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.bot_token"
+                    && error.message.contains("required")
+            }));
+        }
+    }
+
+    #[test]
+    fn channel_fields_reject_unknown_keys_without_exposing_values() {
+        let mut cfg = Config::default();
+        let before = serde_json::to_value(&cfg).expect("serialize config");
+        let before_dirty_paths = cfg.dirty_paths.clone();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "discord",
+            "ops",
+            &[("unknown_secret", "super-secret-value")],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &submission.channels, &mut errors, None);
+
+        assert!(refs.is_empty());
+        let error = errors
+            .iter()
+            .find(|error| error.field == "channels[0].fields.unknown_secret")
+            .expect("structured unknown-field error");
+        assert!(!error.message.contains("super-secret-value"));
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize config"),
+            before
+        );
+        assert_eq!(cfg.dirty_paths, before_dirty_paths);
+    }
+
+    #[test]
+    fn channel_fields_reject_valid_but_unadvertised_schema_keys() {
+        let mut cfg = Config::default();
+        let before = serde_json::to_value(&cfg).expect("serialize config");
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "telegram",
+            "ops",
+            &[
+                ("bot_token", "123:ABC"),
+                ("api_base_url", "https://example.invalid"),
+            ],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &submission.channels, &mut errors, None);
+
+        assert!(refs.is_empty());
+        assert!(errors.iter().any(|error| {
+            error.field == "channels[0].fields.api_base_url"
+                && error.message.contains("not available in Quickstart")
+        }));
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize config"),
+            before
+        );
+    }
+
+    #[test]
+    fn channel_fields_materialize_credential_free_channel() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "imessage",
+            "local",
+            &[],
+        ))];
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply_into errors: {errors:?}");
+        assert!(applied.is_some());
+        assert!(channel_exists(&cfg, "imessage", "local"));
+    }
+
+    #[tokio::test]
+    async fn fresh_whatsapp_web_channel_persists_under_whatsapp_config_family() {
+        for submitted_type in ["whatsapp-web", "whatsapp_web"] {
+            let mut submission = fresh_submission("bot");
+            submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+                submitted_type,
+                "personal",
+                &[],
+            ))];
+            submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
+                name: "self_chat".into(),
+                channel: format!("{submitted_type}.personal"),
+                external_peers: vec!["*".into()],
+                ignore: vec![],
+            }];
+
+            let (dir, _applied) = apply_to_temp(submission).await;
+            let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+            assert!(
+                raw.contains("[channels.whatsapp.personal]"),
+                "WhatsApp Web quickstart must persist under the canonical WhatsApp config family:\n{raw}"
+            );
+            assert!(
+                !raw.contains("[channels.whatsapp-web.personal]")
+                    && !raw.contains("[channels.whatsapp_web.personal]"),
+                "Quickstart must not write a non-schema WhatsApp Web table:\n{raw}"
+            );
+
+            let reloaded = reload(&dir);
+            let whatsapp = reloaded
+                .channels
+                .whatsapp
+                .get("personal")
+                .expect("canonical WhatsApp alias persisted");
+            let expected_session = dir
+                .path()
+                .join("state")
+                .join("whatsapp-web")
+                .join("personal.db")
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                whatsapp.session_path.as_deref(),
+                Some(expected_session.as_str())
+            );
+            assert!(
+                whatsapp.is_web_config(),
+                "fresh WhatsApp Web entry must seed a Web selector"
+            );
+            let agent = reloaded.agents.get("bot").expect("agent persisted");
+            let bound: Vec<String> = agent.channels.iter().map(|c| c.to_string()).collect();
+            assert_eq!(
+                bound,
+                vec!["whatsapp.personal".to_string()],
+                "agent must bind the canonical channel ref"
+            );
+            let group = reloaded
+                .peer_groups
+                .get("self_chat")
+                .expect("peer group persisted");
+            assert_eq!(group.channel, "whatsapp.personal");
+        }
     }
 
     #[tokio::test]
     async fn peer_groups_persist_to_canonical_section() {
         let mut submission = fresh_submission("bot");
-        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
-            channel_type: "telegram".into(),
-            alias: "tg".into(),
-            token: Some("tok-a".into()),
-        })];
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "telegram",
+            "tg",
+            &[("bot_token", "tok-a")],
+        ))];
         submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
             name: "team".into(),
             channel: "telegram.tg".into(),

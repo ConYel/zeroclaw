@@ -138,6 +138,28 @@ impl ApprovalManager {
         }
     }
 
+    /// Derive a manager for a different agent's risk profile while preserving
+    /// THIS manager's interactivity mode. Used when a delegated execution (an
+    /// SOP step naming a different agent) must run under the delegate agent's
+    /// own approval policy without losing an operator approval route the
+    /// current surface provides: an interactive parent stays interactive, a
+    /// back-channel parent keeps routing shell approvals through the client
+    /// channel, and a plain non-interactive parent stays auto-deny. Policy
+    /// sets (`auto_approve` / `always_ask` / autonomy level) come entirely
+    /// from `risk_profile`; the session allowlist and audit trail start
+    /// fresh — "Always" grants to one agent never transfer to another.
+    pub fn derive_for_risk_profile(&self, risk_profile: &RiskProfileConfig) -> Self {
+        Self {
+            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
+            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            autonomy_level: risk_profile.level,
+            non_interactive: self.non_interactive,
+            non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Returns `true` when this manager operates in non-interactive mode
     /// (i.e. for channel-driven runs where no operator can approve).
     pub fn is_non_interactive(&self) -> bool {
@@ -239,10 +261,17 @@ impl ApprovalManager {
 /// terminal when available, falling back to stdin otherwise.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     let summary = summarize_args(&request.arguments);
+    let tool_args = [("tool", request.tool_name.as_str())];
     eprintln!();
-    eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
+    eprintln!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
+    );
     eprintln!("   {summary}");
-    eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
+    eprint!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
+    );
     let _ = io::stderr().flush();
 
     let Ok(line) = read_cli_approval_line() else {
@@ -352,7 +381,9 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
 /// human-readable summaries. Matches anywhere in the (lowercased) key:
 /// covers `api_key`, `api-key`, `apiKey`, `oauth_token`, `secret`,
 /// `password`, `auth_token`, `bearer`, `client_secret`, `private_key`, etc.
-fn looks_like_secret_key(key: &str) -> bool {
+/// Shared conservative heuristic for summary surfaces. A caller must still
+/// avoid rendering untrusted composite values by default.
+pub fn looks_like_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     [
         "secret",
