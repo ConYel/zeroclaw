@@ -1,5 +1,7 @@
 # Web dashboard (`gateway.web_dist_dir`)
 
+When ZeroClaw is built with the `embedded-web` feature, the compiled-in dashboard assets take precedence over `gateway.web_dist_dir` and the filesystem locations described below. Filesystem resolution and API-only fallback apply when embedded assets are unavailable.
+
 The gateway daemon ships its HTTP API in the binary, but the web dashboard
 HTML/JS/CSS lives on disk in a `web/dist/` directory produced by Vite. The
 `gateway.web_dist_dir` setting (and its {{#env-var-name gateway.web_dist_dir}}

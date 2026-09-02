@@ -5031,6 +5031,7 @@ path = "{trigger_path}"
         assert!(text.contains("dashboard shell"));
     }
 
+    #[cfg(not(feature = "embedded-web"))]
     #[tokio::test]
     async fn spa_fallback_reports_unavailable_without_dashboard_assets() {
         let tmp = tempfile::TempDir::new().unwrap();
