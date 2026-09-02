@@ -402,6 +402,7 @@ pub enum WebDashboardAvailability {
 pub fn resolve_web_dashboard_availability(config: &Config) -> Option<WebDashboardAvailability> {
     #[cfg(feature = "embedded-web")]
     {
+        let _ = config;
         Some(WebDashboardAvailability::Embedded)
     }
     #[cfg(not(feature = "embedded-web"))]
@@ -4991,6 +4992,16 @@ path = "{trigger_path}"
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("dashboard shell"));
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_reports_unavailable_without_dashboard_assets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        let response = spa_fallback_response("/", state).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
