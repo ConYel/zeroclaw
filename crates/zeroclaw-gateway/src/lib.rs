@@ -411,6 +411,17 @@ pub fn resolve_web_dashboard_availability(config: &Config) -> Option<WebDashboar
     }
 }
 
+fn has_servable_dashboard_index(dir: &std::path::Path) -> bool {
+    let Ok(canonical_root) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    let Ok(canonical_index) = std::fs::canonicalize(canonical_root.join("index.html")) else {
+        return false;
+    };
+
+    canonical_index.starts_with(&canonical_root) && canonical_index.is_file()
+}
+
 pub fn resolve_web_dist_dir(config: &Config) -> Option<std::path::PathBuf> {
     match config
         .gateway
@@ -418,7 +429,7 @@ pub fn resolve_web_dist_dir(config: &Config) -> Option<std::path::PathBuf> {
         .as_ref()
         .map(std::path::PathBuf::from)
     {
-        Some(explicit) if explicit.join("index.html").is_file() => Some(explicit),
+        Some(explicit) if has_servable_dashboard_index(&explicit) => Some(explicit),
         Some(_) | None => auto_detect_web_dist_dir(),
     }
 }
@@ -438,7 +449,7 @@ fn auto_detect_web_dist_dir() -> Option<std::path::PathBuf> {
     }
     candidates
         .into_iter()
-        .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
+        .find(|p| !p.as_os_str().is_empty() && has_servable_dashboard_index(p))
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
@@ -1349,14 +1360,14 @@ pub async fn run_gateway(
         .web_dist_dir
         .as_ref()
         .map(std::path::PathBuf::from)
-        && !stale.join("index.html").is_file()
+        && !has_servable_dashboard_index(&stale)
     {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"configured": stale.display().to_string()})),
-            "gateway.web_dist_dir points at a path that doesn't contain index.html on \
+            "gateway.web_dist_dir points at a path without a usable index.html on \
              this machine; falling back to auto-detect. Update or remove the setting in \
              config.toml to silence this warning."
         );
@@ -4358,6 +4369,32 @@ mod tests {
         assert_ne!(
             resolve_web_dist_dir(&config),
             Some(temp.path().to_path_buf())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_index_rejects_symlink_that_escapes_dashboard_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create dashboard root");
+        let outside = tempfile::tempdir().expect("create outside directory");
+        std::fs::write(outside.path().join("index.html"), "outside dashboard")
+            .expect("write outside index");
+        symlink(
+            outside.path().join("index.html"),
+            root.path().join("index.html"),
+        )
+        .expect("link escaping index");
+
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some(root.path().display().to_string());
+
+        assert!(!has_servable_dashboard_index(root.path()));
+        assert_ne!(
+            resolve_web_dist_dir(&config),
+            Some(root.path().to_path_buf()),
+            "the resolver must not report an index the serving layer rejects"
         );
     }
 
