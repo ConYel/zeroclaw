@@ -1362,8 +1362,8 @@ pub async fn run_gateway(
         );
     }
 
-    // Derive dashboard availability from the single resolved `web_dist_dir`
-    // snapshot so the log and banner always agree with what AppState serves.
+    // Embedded assets take serving priority when compiled in. Otherwise, use
+    // the single resolved `web_dist_dir` snapshot stored in AppState.
     let availability: Option<WebDashboardAvailability> = {
         #[cfg(feature = "embedded-web")]
         {
