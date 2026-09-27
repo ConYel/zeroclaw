@@ -197,13 +197,15 @@ where
             audit_enabled,
         ),
         MemoryBackendKind::Unknown => {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"backend_name": backend_name, "unknown_context": unknown_context})), "Unknown memory backend '', falling back to markdown");
-            wrap_scanned_and_audit(
-                MarkdownMemory::new("markdown", workspace_dir),
-                policy,
-                workspace_dir,
-                audit_enabled,
-            )
+            let valid = selectable_memory_backends()
+                .iter()
+                .map(|profile| profile.key)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "unknown memory backend {backend_name:?}{unknown_context}; set memory.backend to \
+                 one of: {valid}"
+            );
         }
     }
 }
@@ -2234,14 +2236,98 @@ store_timeout_ms = 40000
     }
 
     #[test]
-    fn factory_unknown_falls_back_to_markdown() {
+    fn factory_unknown_backend_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
             backend: "redis".into(),
             ..MemoryConfig::default()
         };
+        let msg = match create_memory(&cfg, tmp.path(), None) {
+            Ok(_) => panic!("an unrecognised backend must not silently select another store"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains("redis"),
+            "error must name the rejected backend: {msg}"
+        );
+        assert!(
+            selectable_memory_backends()
+                .iter()
+                .all(|p| p.key != "redis"),
+            "test is only meaningful while redis is not a selectable backend"
+        );
+        for profile in selectable_memory_backends() {
+            assert!(
+                msg.contains(profile.key),
+                "error must list every selectable backend, missing {:?}: {msg}",
+                profile.key
+            );
+        }
+    }
+
+    #[test]
+    fn factory_markdown_remains_selectable() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "markdown");
+    }
+
+    #[test]
+    fn factory_empty_backend_is_disabled_memory_not_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: String::new(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "none");
+    }
+
+    #[test]
+    fn factory_bare_qdrant_reports_its_own_storage_defect() {
+        // Quickstart offers Qdrant although it is deliberately outside
+        // `selectable_memory_backends()`; a bare `qdrant` value must report its missing
+        // storage entry rather than the unknown-backend hint, which names no Qdrant form.
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "qdrant".into(),
+            ..MemoryConfig::default()
+        };
+        let err = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("qdrant without storage config must not construct a store");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires a `[storage.qdrant."),
+            "must name the missing storage table: {msg}"
+        );
+        assert!(
+            !msg.contains("set memory.backend to one of"),
+            "the selectable-backend hint must not be attached to a deliberately \
+             non-selectable backend: {msg}"
+        );
+    }
+
+    #[test]
+    fn migration_factory_unknown_backend_names_its_context() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.memory.backend = "redis".into();
+        let msg = match create_memory_for_migration(&config) {
+            Ok(_) => panic!("migration must not import into a store the config did not name"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains("during migration"),
+            "error must carry the call-site context: {msg}"
+        );
     }
 
     #[test]
