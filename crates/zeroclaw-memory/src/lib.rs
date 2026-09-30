@@ -18,6 +18,7 @@ pub mod consolidation;
 pub mod decay;
 pub mod dedup;
 pub mod embeddings;
+pub mod failed;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -56,6 +57,7 @@ pub use backend::{
 };
 #[allow(unused_imports)]
 pub use embeddings::EmbeddingIdentity;
+pub use failed::FailedMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -570,6 +572,22 @@ pub fn create_memory_with_storage_and_routes(
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
+    // A non-empty reference whose extracted kind is empty (`.default`, `.`,
+    // `..sqlite`) is a malformed value, not a disable request: classification
+    // of the extracted kind would collapse it into the documented
+    // blank-disables path and silently disable persistence.
+    if !config.backend.trim().is_empty() && backend_name.is_empty() {
+        let valid = selectable_memory_backends()
+            .iter()
+            .map(|profile| profile.key)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "malformed memory backend reference {:?}: no backend name before '.'; \
+             set memory.backend to one of: {valid}",
+            config.backend
+        );
+    }
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
@@ -2262,6 +2280,49 @@ store_timeout_ms = 40000
                 "error must list every selectable backend, missing {:?}: {msg}",
                 profile.key
             );
+        }
+    }
+
+    #[test]
+    fn factory_malformed_dotted_reference_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        for raw in [".default", ".", "..", ".sqlite"] {
+            let cfg = zeroclaw_config::schema::Config {
+                memory: MemoryConfig {
+                    backend: raw.into(),
+                    ..MemoryConfig::default()
+                },
+                data_dir: tmp.path().to_path_buf(),
+                ..zeroclaw_config::schema::Config::default()
+            };
+            let msg = match create_memory_from_config(&cfg, None) {
+                Ok(_) => panic!("malformed reference {raw:?} must not silently disable memory"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                msg.contains(raw) && msg.contains("malformed"),
+                "error must name the malformed reference {raw:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn factory_blank_and_none_backends_still_disable_memory() {
+        // Control for the malformed-reference fix: the documented blank
+        // disables path and the explicit "none" backend must keep working.
+        let tmp = TempDir::new().unwrap();
+        for raw in ["", "   ", "none"] {
+            let cfg = zeroclaw_config::schema::Config {
+                memory: MemoryConfig {
+                    backend: raw.into(),
+                    ..MemoryConfig::default()
+                },
+                data_dir: tmp.path().to_path_buf(),
+                ..zeroclaw_config::schema::Config::default()
+            };
+            let mem =
+                create_memory_from_config(&cfg, None).expect("blank/none must still construct");
+            assert_eq!(mem.name(), "none", "backend {raw:?} must disable memory");
         }
     }
 
