@@ -222,6 +222,25 @@ pub fn backend_kind_from_dotted(memory_backend: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Reject a non-empty `memory.backend` reference whose dotted kind is empty
+/// (`.default`, `.`, `..sqlite`): classification of the extracted kind would
+/// collapse it into the documented blank-disables path and silently disable
+/// persistence. Blank values and explicit `none` keep disabling memory.
+fn validate_memory_backend_reference(backend: &str) -> anyhow::Result<()> {
+    if !backend.trim().is_empty() && backend_kind_from_dotted(backend).is_empty() {
+        let valid = selectable_memory_backends()
+            .iter()
+            .map(|profile| profile.key)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "malformed memory backend reference {backend:?}: no backend name before '.'; \
+             set memory.backend to one of: {valid}"
+        );
+    }
+    Ok(())
+}
+
 /// Legacy auto-save key used for model-authored assistant summaries.
 /// These entries are treated as untrusted context and should not be re-injected.
 pub fn is_assistant_autosave_key(key: &str) -> bool {
@@ -572,22 +591,7 @@ pub fn create_memory_with_storage_and_routes(
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
-    // A non-empty reference whose extracted kind is empty (`.default`, `.`,
-    // `..sqlite`) is a malformed value, not a disable request: classification
-    // of the extracted kind would collapse it into the documented
-    // blank-disables path and silently disable persistence.
-    if !config.backend.trim().is_empty() && backend_name.is_empty() {
-        let valid = selectable_memory_backends()
-            .iter()
-            .map(|profile| profile.key)
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::bail!(
-            "malformed memory backend reference {:?}: no backend name before '.'; \
-             set memory.backend to one of: {valid}",
-            config.backend
-        );
-    }
+    validate_memory_backend_reference(&config.backend)?;
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
@@ -661,6 +665,7 @@ pub fn create_memory_with_storage_and_routes(
         active_storage,
         workspace_dir,
         Some(&resolved_embedding),
+        "",
     )
 }
 
@@ -673,7 +678,9 @@ fn build_memory_with_storage(
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
     resolved_embedding: Option<&ResolvedEmbeddingConfig>,
+    unknown_context: &str,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    validate_memory_backend_reference(&config.backend)?;
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
 
@@ -816,7 +823,7 @@ fn build_memory_with_storage(
                 resolved_embedding,
             )
         },
-        "",
+        unknown_context,
         &config.policy,
         config.audit_enabled,
     )
@@ -951,6 +958,9 @@ fn spawn_auto_reindex(mem: &SqliteMemory) {
 }
 
 pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
+    // Validate before the None-classification below: a malformed reference
+    // (`.default`) must be reported as malformed, not as a 'none' disable.
+    validate_memory_backend_reference(&config.memory.backend)?;
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         anyhow::bail!(
@@ -997,6 +1007,7 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
         config.resolve_active_storage(),
         &config.data_dir,
         qdrant_embedding.as_ref(),
+        " during migration",
     )
 }
 
@@ -2388,6 +2399,30 @@ url = "http://localhost:6333"
                 "error must name the malformed reference {raw:?}: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn migration_factory_malformed_reference_names_the_value_not_none() {
+        // The migration path fails closed on `.default` via the None
+        // classification, but that error claims the value was 'none' —
+        // the malformed-reference validation must fire first.
+        let tmp = TempDir::new().unwrap();
+        let cfg = zeroclaw_config::schema::Config {
+            memory: MemoryConfig {
+                backend: ".default".into(),
+                ..MemoryConfig::default()
+            },
+            data_dir: tmp.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let msg = match create_memory_for_migration(&cfg) {
+            Ok(_) => panic!("malformed reference must not be reported as 'none'"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains(".default") && msg.contains("malformed"),
+            "error must name the malformed reference, not claim 'none': {msg}"
+        );
     }
 
     #[test]
