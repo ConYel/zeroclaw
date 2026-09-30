@@ -6166,9 +6166,9 @@ pub(crate) mod tests {
     }
 
     mod failed_memory_endpoint {
-        //! Regression for PR #11209 review (FATAL): a failed-to-build backend
-        //! must surface as an error on the write endpoints, never as a no-op
-        //! success that acknowledges unpersisted data.
+        //! A failed-to-build backend must surface as an error on the write
+        //! endpoints, never as a no-op success that acknowledges unpersisted
+        //! data.
 
         use super::*;
         use zeroclaw_memory::FailedMemory;

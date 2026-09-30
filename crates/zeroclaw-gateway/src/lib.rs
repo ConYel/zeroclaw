@@ -13585,9 +13585,8 @@ mod select_gateway_memory_tests {
 
     #[test]
     fn unknown_backend_installs_failed_memory_not_none() {
-        // Regression (PR #11209 review, FATAL): the gateway used to install
-        // NoneMemory on construction failure, so `POST /api/memory` answered
-        // 200 ok while nothing was stored.
+        // A construction failure used to install NoneMemory, so
+        // `POST /api/memory` answered 200 ok while nothing was stored.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_with_backend("sqilte", tmp.path());
         let mem = select_gateway_memory(&config, None);
@@ -13596,8 +13595,8 @@ mod select_gateway_memory_tests {
 
     #[test]
     fn malformed_dotted_reference_installs_failed_memory() {
-        // Regression (PR #11209 review, MAJOR): `.default` used to classify as
-        // the blank-disables input and silently disable persistence.
+        // `.default` used to classify as the blank-disables input and
+        // silently disable persistence.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_with_backend(".default", tmp.path());
         let mem = select_gateway_memory(&config, None);
