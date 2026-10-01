@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>PoC auth bootstrap — test only</title>
+</head>
+<body>
+  <p>Storing token from URL fragment into localStorage(zeroclaw_token) for origin 127.0.0.1:8080, then redirecting…</p>
+  <script>
+    var t = new URLSearchParams(location.hash.slice(1)).get("token");
+    if (t) {
+      localStorage.setItem("zeroclaw_token", t);
+      document.body.appendChild(document.createTextNode("Token stored (" + t.length + " chars). Redirecting…"));
+      setTimeout(function () { location.href = "/"; }, 400);
+    } else {
+      document.body.appendChild(document.createTextNode("No #token= fragment found."));
+    }
+  </script>
+</body>
+</html>

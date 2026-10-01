@@ -1,0 +1,22 @@
+:8081 {
+	header Cache-Control "no-store"
+	log {
+		output stdout
+		format json
+	}
+	handle /api/* {
+		reverse_proxy 127.0.0.1:42617 {
+			header_up Authorization "Bearer {env.POC_TOKEN}"
+		}
+	}
+	handle /_app/* {
+		uri strip_prefix /_app
+		file_server
+		root /zc/web/dist
+	}
+	handle {
+		file_server
+		root /zc/web/dist
+		try_files {path} /index.html
+	}
+}
