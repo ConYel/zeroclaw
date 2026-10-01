@@ -1,5 +1,6 @@
 # Standalone PoC workspace — deliberately NOT a member of the zeroclaw
-# workspace so the default build is untouched (RFC #8132 Phase 1 contract).
+# workspace so the default build is untouched. Tracked in the web UI
+# evaluation issue.
 
 [workspace]
 
