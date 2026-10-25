@@ -1,4 +1,4 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage};
 use async_trait::async_trait;
 
 /// Memory backend placeholder for a configured backend that failed to build.
@@ -21,7 +21,9 @@ impl FailedMemory {
     pub fn new(alias: &str, cause: &anyhow::Error) -> Self {
         Self {
             alias: alias.to_string(),
-            cause: cause.to_string(),
+            // `{:#}` keeps the whole context chain, so the root cause (why
+            // SQLite could not open, which alias was missing) survives.
+            cause: format!("{cause:#}"),
         }
     }
 
@@ -129,6 +131,70 @@ impl Memory for FailedMemory {
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         Err(self.err())
     }
+
+    // The trait defaults below answer success (empty results, zero counts,
+    // no-op writes) for backends without the capability. For a backend that
+    // failed to build that is a false success, so each one fails loudly.
+
+    async fn get_for_agent(
+        &self,
+        _key: &str,
+        _agent_id: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        Err(self.err())
+    }
+
+    async fn recall_namespaced(
+        &self,
+        _namespace: &str,
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        Err(self.err())
+    }
+
+    async fn export_agent(&self, _agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        Err(self.err())
+    }
+
+    async fn count_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+        Err(self.err())
+    }
+
+    async fn supersede(&self, _superseded_ids: &[String], _new_id: &str) -> anyhow::Result<()> {
+        Err(self.err())
+    }
+
+    async fn store_procedural(
+        &self,
+        _messages: &[ProceduralMessage],
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Err(self.err())
+    }
+
+    async fn count_in_scope(
+        &self,
+        _namespace: Option<&str>,
+        _category: Option<&MemoryCategory>,
+    ) -> anyhow::Result<u64> {
+        Err(self.err())
+    }
+
+    async fn stats(&self) -> anyhow::Result<MemoryStats> {
+        Err(self.err())
+    }
+
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        Err(self.err())
+    }
+
+    async fn ensure_agent_uuid(&self, _alias: &str) -> anyhow::Result<String> {
+        Err(self.err())
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +236,42 @@ mod tests {
                 .is_err()
         );
         assert!(!memory.health_check().await);
+
+        // Trait defaults that would otherwise report success.
+        assert!(memory.get_for_agent("k", "a").await.is_err());
+        assert!(
+            memory
+                .recall_namespaced("ns", "k", 0, None, None, None)
+                .await
+                .is_err()
+        );
+        assert!(memory.export_agent("a").await.is_err());
+        assert!(memory.count_agent("a").await.is_err());
+        assert!(memory.supersede(&["x".into()], "y").await.is_err());
+        assert!(memory.store_procedural(&[], None).await.is_err());
+        assert!(memory.count_in_scope(None, None).await.is_err());
+        assert!(memory.stats().await.is_err());
+        assert!(memory.reindex().await.is_err());
+        assert!(memory.ensure_agent_uuid("a").await.is_err());
+        assert!(
+            memory
+                .export(&super::super::traits::ExportFilter::default())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_memory_keeps_the_full_cause_chain() {
+        let cause = anyhow::Error::msg("unable to open database file")
+            .context("SQLite failed to open database");
+        let memory = FailedMemory::new("sqlite", &cause);
+        let msg = memory.count().await.unwrap_err().to_string();
+        assert!(
+            msg.contains("SQLite failed to open database")
+                && msg.contains("unable to open database file"),
+            "root cause must survive: {msg}"
+        );
     }
 
     #[tokio::test]

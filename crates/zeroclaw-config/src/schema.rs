@@ -12707,9 +12707,9 @@ pub struct MemoryConfig {
     /// Dotted reference to the active storage instance: `<backend>.<alias>`
     /// (e.g. `"sqlite.default"`, `"postgres.work"`). Resolves through
     /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
-    /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"`, or
-    /// leave it empty, to disable persistence entirely. A value outside the
-    /// built-in backends is rejected when memory is constructed; it does not
+    /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
+    /// disable persistence entirely. A blank value, or a value outside the
+    /// built-in backends, is rejected when memory is constructed; it does not
     /// fall back to another backend.
     #[serde(default = "default_memory_backend")]
     pub backend: String,

@@ -222,23 +222,45 @@ pub fn backend_kind_from_dotted(memory_backend: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Reject a non-empty `memory.backend` reference whose dotted kind is empty
-/// (`.default`, `.`, `..sqlite`): classification of the extracted kind would
-/// collapse it into the documented blank-disables path and silently disable
-/// persistence. Blank values and explicit `none` keep disabling memory.
-fn validate_memory_backend_reference(backend: &str) -> anyhow::Result<()> {
-    if !backend.trim().is_empty() && backend_kind_from_dotted(backend).is_empty() {
-        let valid = selectable_memory_backends()
+/// Reject a `memory.backend` reference that names no backend: a blank value
+/// (only the explicit `none` disables memory), or a dotted reference whose
+/// kind is empty (`.default`, `.`, `..sqlite`), which would otherwise
+/// classify as disabled and silently drop persistence.
+pub fn validate_memory_backend_reference(backend: &str) -> anyhow::Result<()> {
+    let valid = || {
+        selectable_memory_backends()
             .iter()
             .map(|profile| profile.key)
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", ")
+    };
+    if backend.trim().is_empty() {
+        anyhow::bail!(
+            "memory backend is blank ({backend:?}); set memory.backend to one of: {}, \
+             or \"none\" to disable memory explicitly",
+            valid()
+        );
+    }
+    if backend_kind_from_dotted(backend).is_empty() {
         anyhow::bail!(
             "malformed memory backend reference {backend:?}: no backend name before '.'; \
-             set memory.backend to one of: {valid}"
+             set memory.backend to one of: {}",
+            valid()
         );
     }
     Ok(())
+}
+
+/// The memory backend a status surface should report: the resolved storage
+/// kind, or `None` when the configured reference names no backend, so the
+/// caller shows it as invalid instead of "none" (deliberately disabled).
+pub fn reportable_memory_backend(config: &Config) -> Option<&'static str> {
+    validate_memory_backend_reference(&config.memory.backend).ok()?;
+    let kind = backend_kind_from_dotted(&config.memory.backend);
+    if matches!(classify_memory_backend(&kind), MemoryBackendKind::Unknown) {
+        return None;
+    }
+    Some(config.resolve_active_storage().kind())
 }
 
 /// Legacy auto-save key used for model-authored assistant summaries.
@@ -2426,11 +2448,28 @@ url = "http://localhost:6333"
     }
 
     #[test]
-    fn factory_blank_and_none_backends_still_disable_memory() {
-        // Control for the malformed-reference fix: the documented blank
-        // disables path and the explicit "none" backend must keep working.
+    fn reportable_backend_reports_invalid_not_none() {
         let tmp = TempDir::new().unwrap();
-        for raw in ["", "   ", "none"] {
+        let cfg_for = |raw: &str| zeroclaw_config::schema::Config {
+            memory: MemoryConfig {
+                backend: raw.into(),
+                ..MemoryConfig::default()
+            },
+            data_dir: tmp.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        // Values memory construction rejects must never read as "none".
+        for raw in ["", "   ", ".default", "sqilte"] {
+            assert_eq!(reportable_memory_backend(&cfg_for(raw)), None, "{raw:?}");
+        }
+        // Explicit none is a real, reportable choice.
+        assert_eq!(reportable_memory_backend(&cfg_for("none")), Some("none"));
+    }
+
+    #[test]
+    fn migration_factory_rejects_blank_backend() {
+        let tmp = TempDir::new().unwrap();
+        for raw in ["", "   "] {
             let cfg = zeroclaw_config::schema::Config {
                 memory: MemoryConfig {
                     backend: raw.into(),
@@ -2439,10 +2478,59 @@ url = "http://localhost:6333"
                 data_dir: tmp.path().to_path_buf(),
                 ..zeroclaw_config::schema::Config::default()
             };
-            let mem =
-                create_memory_from_config(&cfg, None).expect("blank/none must still construct");
-            assert_eq!(mem.name(), "none", "backend {raw:?} must disable memory");
+            let msg = match create_memory_for_migration(&cfg) {
+                Ok(_) => panic!("blank backend {raw:?} must not construct for migration"),
+                Err(err) => err.to_string(),
+            };
+            assert!(msg.contains("blank"), "{raw:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn factory_blank_backend_fails_closed() {
+        // Blank is not an explicit choice: it must fail construction, never
+        // silently provision NoneMemory.
+        let tmp = TempDir::new().unwrap();
+        for raw in ["", "   "] {
+            let cfg = zeroclaw_config::schema::Config {
+                memory: MemoryConfig {
+                    backend: raw.into(),
+                    ..MemoryConfig::default()
+                },
+                data_dir: tmp.path().to_path_buf(),
+                ..zeroclaw_config::schema::Config::default()
+            };
+            let Err(err) = create_memory_from_config(&cfg, None) else {
+                panic!("blank backend {raw:?} must not construct");
+            };
+            let msg = format!("{err:#}");
+            assert!(msg.contains("blank"), "{raw:?}: {msg}");
+            assert!(msg.contains("none"), "{raw:?}: {msg}");
+
+            let bare = MemoryConfig {
+                backend: raw.into(),
+                ..MemoryConfig::default()
+            };
+            assert!(
+                create_memory(&bare, tmp.path(), None).is_err(),
+                "bare factory: blank backend {raw:?} must not construct"
+            );
+        }
+    }
+
+    #[test]
+    fn factory_explicit_none_still_disables_memory() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = zeroclaw_config::schema::Config {
+            memory: MemoryConfig {
+                backend: "none".into(),
+                ..MemoryConfig::default()
+            },
+            data_dir: tmp.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let mem = create_memory_from_config(&cfg, None).expect("explicit none must construct");
+        assert_eq!(mem.name(), "none");
     }
 
     #[test]
@@ -2454,17 +2542,6 @@ url = "http://localhost:6333"
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "markdown");
-    }
-
-    #[test]
-    fn factory_empty_backend_is_disabled_memory_not_markdown() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: String::new(),
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "none");
     }
 
     #[test]

@@ -15489,6 +15489,18 @@ mod select_gateway_memory_tests {
     }
 
     #[test]
+    fn blank_backend_installs_failed_memory() {
+        // Blank is not an explicit `none`: it must fail loudly, never
+        // select NoneMemory that acknowledges writes it never stores.
+        let tmp = tempfile::TempDir::new().unwrap();
+        for raw in ["", "   "] {
+            let config = config_with_backend(raw, tmp.path());
+            let mem = select_gateway_memory(&config, None);
+            assert_eq!(mem.name(), "failed", "backend {raw:?}");
+        }
+    }
+
+    #[test]
     fn no_agents_still_selects_none_memory() {
         let mut config = Config {
             data_dir: std::env::temp_dir(),

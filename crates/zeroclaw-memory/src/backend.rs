@@ -100,11 +100,9 @@ pub fn default_memory_backend_key() -> &'static str {
 }
 
 pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
-    // An empty value is the config layer's documented "no storage" input
-    // (`Config::resolve_active_storage`), not an unrecognised backend name.
-    if backend.trim().is_empty() {
-        return MemoryBackendKind::None;
-    }
+    // Only the explicit "none" disables memory. A blank value is not a
+    // choice someone wrote down, so it classifies as unknown and fails
+    // construction like any other unrecognised name.
     match backend {
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
@@ -202,9 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_treats_an_empty_backend_as_disabled_not_unknown() {
-        assert_eq!(classify_memory_backend(""), MemoryBackendKind::None);
-        assert_eq!(classify_memory_backend("   "), MemoryBackendKind::None);
+    fn classify_treats_a_blank_backend_as_unknown_not_disabled() {
+        assert_eq!(classify_memory_backend(""), MemoryBackendKind::Unknown);
+        assert_eq!(classify_memory_backend("   "), MemoryBackendKind::Unknown);
     }
 
     #[test]
