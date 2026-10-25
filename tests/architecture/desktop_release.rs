@@ -3,6 +3,31 @@
 use std::{fs, path::Path};
 
 #[test]
+fn windows_desktop_manifest_selects_common_controls_v6() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = fs::read_to_string(root.join("apps/tauri/windows/app.manifest"))
+        .expect("Windows desktop manifest should be readable");
+
+    for required in [
+        "name=\"Microsoft.Windows.Common-Controls\"",
+        "version=\"6.0.0.0\"",
+        "publicKeyToken=\"6595b64144ccf1df\"",
+    ] {
+        assert!(
+            manifest.contains(required),
+            "Windows desktop manifest must select Common Controls v6: missing {required}"
+        );
+    }
+
+    let build_script = fs::read_to_string(root.join("apps/tauri/build.rs"))
+        .expect("Tauri build script should be readable");
+    assert!(
+        build_script.contains("app_manifest(include_str!(\"windows/app.manifest\"))"),
+        "Tauri must embed the guarded Windows application manifest"
+    );
+}
+
+#[test]
 fn macos_desktop_sidecar_embeds_the_web_artifact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow = fs::read_to_string(root.join(".github/workflows/release-stable-manual.yml"))
@@ -65,8 +90,14 @@ fn macos_desktop_sidecar_embeds_the_web_artifact() {
         .expect("desktop kernel preparation script should be readable");
     assert!(
         prepare.lines().any(|line| {
-            line.contains("cargo build") && line.contains("--features \"$FEATURES\"")
+            line.contains("cargo build") && line.contains("--features \"$resolved_features\"")
         }),
-        "prepare-kernel.sh must forward the requested Cargo features"
+        "prepare-kernel.sh must build the resolved distribution and requested Cargo features"
+    );
+    assert!(
+        prepare.contains("cargo run --quiet --locked -p xtask --bin generate -- features")
+            && prepare.contains("--selection \"$DISTRIBUTION\" --target \"$triple\"")
+            && prepare.contains("resolved_features=\"$resolved_features,$FEATURES\""),
+        "the desktop build must resolve its distribution and append requested features"
     );
 }

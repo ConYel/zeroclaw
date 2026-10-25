@@ -110,8 +110,8 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
     };
 
     let actual_exit = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = crate::tools::shell_output::decode_shell_output(&output.stdout);
+    let stderr = crate::tools::shell_output::decode_shell_output(&output.stderr);
     let combined = format!("{stdout}{stderr}");
 
     if verbose {
@@ -311,7 +311,7 @@ fn truncate_output(s: &str, max: usize) -> String {
         // inside a multi-byte UTF-8 char (non-ASCII skill output). Round down
         // to the nearest char boundary first (matches skills/review.rs).
         let end = trimmed.floor_char_boundary(max);
-        format!("{}...", &trimmed[..end].replace('\n', " "))
+        format!("{}...", trimmed[..end].replace('\n', " "))
     }
 }
 

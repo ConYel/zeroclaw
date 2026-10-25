@@ -20,6 +20,9 @@ additional-js = [
 ]
 additional-css = ["theme/pc-themes.css", "theme/custom.css"]
 
+[output.html.redirect]
+"/contributing/multi-agent-setup.html" = "../agents/multi-agent-setup.html"
+
 [output.html.search]
 enable = true
 limit-results = 30
@@ -41,3 +44,7 @@ before = ["links"]
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
+
+[preprocessor.placeholders]
+command = "../../target/release/mdbook placeholders"
+after = ["gettext", "mermaid"]

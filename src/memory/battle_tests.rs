@@ -35,9 +35,16 @@ mod tests {
         .await
         .unwrap();
 
-        let pipeline = RetrievalPipeline::new(Arc::new(mem), RetrievalConfig::default());
+        // This test exercises the hot cache, which is opt-in (off by default).
+        let pipeline = RetrievalPipeline::new(
+            Arc::new(mem),
+            RetrievalConfig {
+                cache_enabled: true,
+                ..RetrievalConfig::default()
+            },
+        );
 
-        // First call — cache miss, hits FTS
+        // First call: cache miss, hits FTS
         let r1 = pipeline
             .recall("Rust", 10, None, None, None, None)
             .await
@@ -67,7 +74,14 @@ mod tests {
         .unwrap();
 
         let mem = Arc::new(mem);
-        let pipeline = RetrievalPipeline::new(mem.clone(), RetrievalConfig::default());
+        // This test exercises the hot cache, which is opt-in (off by default).
+        let pipeline = RetrievalPipeline::new(
+            mem.clone(),
+            RetrievalConfig {
+                cache_enabled: true,
+                ..RetrievalConfig::default()
+            },
+        );
 
         let _ = pipeline
             .recall("searchable", 10, None, None, None, None)
@@ -374,6 +388,7 @@ mod tests {
     #[test]
     fn conflict_detection_skips_non_core() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "daily1".into(),
             content: "User prefers Rust".into(),
@@ -401,6 +416,7 @@ mod tests {
     #[test]
     fn conflict_detection_skips_already_superseded() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "old_pref".into(),
             content: "User prefers Rust for systems work".into(),
@@ -429,6 +445,7 @@ mod tests {
     #[test]
     fn conflict_detection_identical_content_not_flagged() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "pref".into(),
             content: "User prefers Rust".into(),
@@ -1040,6 +1057,7 @@ mod tests {
     #[test]
     fn memory_entry_serde_roundtrip_with_new_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "test-id".into(),
             key: "test-key".into(),
             content: "test content".into(),

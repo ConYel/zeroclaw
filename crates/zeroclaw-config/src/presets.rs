@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::{DelegationMode, DelegationPolicy};
 use crate::policy::{default_allowed_commands, default_forbidden_paths};
-use crate::schema::{RiskProfileConfig, RuntimeProfileConfig};
+use crate::schema::{RiskProfileConfig, RuntimeProfileConfig, SkillsPromptInjectionMode};
 
 // ─────────────────────────────────────────────────────────────────────
 // Risk presets
@@ -84,9 +84,11 @@ fn locked_down_risk() -> RiskProfileConfig {
         delegation_policy: DelegationPolicy::default(),
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -108,9 +110,11 @@ fn balanced_risk() -> RiskProfileConfig {
         },
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -132,9 +136,11 @@ fn yolo_risk() -> RiskProfileConfig {
         },
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(false),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -262,10 +268,11 @@ fn local_small_runtime() -> RuntimeProfileConfig {
         parallel_tools: Some(false),
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
-        max_system_prompt_chars: Some(4_000),
+        max_system_prompt_chars: Some(8_000),
         max_tool_result_chars: Some(4_000),
         keep_tool_context_turns: Some(1),
         memory_recall_limit: Some(3),
+        prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
         strict_tool_parsing: true,
         ..RuntimeProfileConfig::default()
     }
@@ -340,9 +347,12 @@ pub struct ChannelQuickStart {
     /// `channel_type` in the UI; users override when stacking
     /// multiple aliases of the same channel type.
     pub alias: String,
-    /// Bot token / shared secret if the channel needs one
-    /// (Telegram, Discord). `None` for channels that don't.
-    pub token: Option<String>,
+    /// Round-trip of every field the daemon described in
+    /// `quickstart/fields`. Surfaces echo back exactly what was
+    /// emitted; the daemon writes each entry under `<prefix>.<key>`
+    /// using its own schema knowledge.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub fields: std::collections::HashMap<String, String>,
 }
 
 /// Agent identity payload from the Agent step. Personality file
@@ -611,10 +621,14 @@ mod tests {
         assert_eq!(values.max_context_tokens, Some(8_000));
         assert_eq!(values.compact_context, Some(true));
         assert_eq!(values.parallel_tools, Some(false));
-        assert_eq!(values.max_system_prompt_chars, Some(4_000));
+        assert_eq!(values.max_system_prompt_chars, Some(8_000));
         assert_eq!(values.max_tool_result_chars, Some(4_000));
         assert_eq!(values.keep_tool_context_turns, Some(1));
         assert_eq!(values.memory_recall_limit, Some(3));
+        assert_eq!(
+            values.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Compact)
+        );
         assert!(values.strict_tool_parsing);
     }
 
@@ -655,12 +669,16 @@ mod tests {
         assert!(resolved.resolved.strict_tool_parsing);
         assert_eq!(resolved.resolved.max_tool_iterations, 4);
         assert_eq!(resolved.resolved.max_history_messages, 20);
-        assert_eq!(resolved.resolved.max_context_tokens, 8_000);
+        assert_eq!(resolved.resolved.max_context_tokens, Some(8_000));
         assert!(resolved.resolved.compact_context);
         assert!(!resolved.resolved.parallel_tools);
-        assert_eq!(resolved.resolved.max_system_prompt_chars, 4_000);
+        assert_eq!(resolved.resolved.max_system_prompt_chars, 8_000);
         assert_eq!(resolved.resolved.max_tool_result_chars, 4_000);
         assert_eq!(resolved.resolved.keep_tool_context_turns, 1);
+        assert_eq!(
+            resolved.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
         assert_eq!(config.effective_memory_recall_limit("local_agent"), 3);
     }
 
@@ -753,7 +771,7 @@ mod tests {
             channels: vec![SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "cli".into(),
                 alias: "cli".into(),
-                token: None,
+                fields: std::collections::HashMap::new(),
             })],
             peer_groups: vec![],
             agent: AgentIdentity {
@@ -766,5 +784,36 @@ mod tests {
         let json = serde_json::to_string(&submission).expect("serialize");
         let parsed: BuilderSubmission = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, submission);
+    }
+
+    #[test]
+    fn channel_quickstart_round_trips_schema_fields() {
+        let channel = ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "ops".into(),
+            fields: std::collections::HashMap::from([(
+                "bot_token".to_string(),
+                "123:ABC".to_string(),
+            )]),
+        };
+
+        let value = serde_json::to_value(&channel).expect("serialize channel");
+        assert_eq!(value["fields"]["bot_token"], "123:ABC");
+        assert!(value.get("token").is_none());
+        assert_eq!(
+            serde_json::from_value::<ChannelQuickStart>(value).expect("deserialize channel"),
+            channel
+        );
+    }
+
+    #[test]
+    fn channel_quickstart_defaults_missing_fields_to_empty() {
+        let channel: ChannelQuickStart = serde_json::from_value(serde_json::json!({
+            "channel_type": "cli",
+            "alias": "cli"
+        }))
+        .expect("deserialize legacy channel without fields");
+
+        assert!(channel.fields.is_empty());
     }
 }

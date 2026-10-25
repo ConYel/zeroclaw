@@ -14,11 +14,14 @@ the warm-store lifecycle from the
 `crates/zeroclaw-plugins/src/wasm_memory.rs`.
 
 > **Wiring status.** `WasmMemory` implements the runtime's full `Memory` trait
-> against the `memory-plugin` world, capability-gated and unit-covered. The
-> runtime does not yet construct it as a configurable backend; the host lacks
-> a memory counterpart to `channel_plugin_details()`. As with channels, build
+> against the `memory-plugin` world, capability-gated and covered by unit tests
+> and a real-component end-to-end test. The runtime does not yet construct it
+> as a configurable backend; the host lacks a memory counterpart to
+> `channel_plugin_details()`. As with channels, build
 > against the contract: the WIT world and the adapter semantics are the part
-> that freezes.
+> that freezes. The memory world also has no config export yet, so do not
+> request `config_read`; add that only after a typed config ABI and resolver are
+> wired into `WasmMemory`.
 
 ## The data model
 
@@ -139,9 +142,10 @@ Every required method is then a straightforward walk:
 - `recall-for-agents` adds the agent-filter walk over the key's second
   component.
 
-A real backend swaps the map for its store (an embedded KV, a remote vector
-DB over `wasi:http` with the `http_client` permission) without the contract
-changing shape.
+A real backend can swap the map for an embedded store without changing the
+contract shape. The memory adapter intentionally does not link `wasi:http` yet,
+even when its scope carries `http_client`; remote backends require the separate,
+component-tested memory-network boundary.
 
 ## What the host does around you
 
@@ -154,10 +158,17 @@ edges:
 - **Capabilities cached at load.** The host reads your flags once during
   `from_wasm` and never again. There is no dynamic capability discovery;
   restarting the daemon is what re-reads them.
-- **Trap wrapping.** Every call site wraps traps with a named context
-  (`memory.recall-namespaced trapped`, etc.). A trap in one call does not
-  tear down the plugin, but repeated traps make the backend useless; return
-  `err(string)` for expected failures instead of panicking.
+- **One trap ends the backend.** Every call site wraps traps with a named
+  context (`memory.recall-namespaced trapped`, etc.). A trap or exhausted fuel
+  leaves a store Wasmtime refuses to enter again, and a missed deadline
+  interrupts your code partway through, so in each case the host discards your
+  instance and every later call that reaches it fails with
+  `plugin instance is unavailable`. So does a result the host cannot lift,
+  such as one that copies more than Wasmtime's default 128 MiB out of guest
+  memory in a single call. The host does not rebuild it: your entries live
+  only in that instance, and a fresh one would answer as if nothing had been
+  stored. Return `err(string)` for expected failures instead of panicking; an
+  error you return keeps the instance.
 - **Post-filter fallbacks are host-side.** When your `recall-namespaced`
   flag is unset, the namespace filter runs on the host after your `recall`
   returned. Your `limit` handling interacts with that: the host passes the
@@ -168,9 +179,11 @@ edges:
 
 {{#include ../_snippets/plugin-manifest-fields.md}}
 
-For a memory backend: `capabilities` containing `memory`; `config_read` if
-the backend needs connection settings; `http_client` only if it talks to a
-remote store.
+For a memory backend: `capabilities` containing `memory`. Do not request
+`config_read` yet: admission requires a schema, but the current memory world has
+no export through which the host can deliver the resulting object. Do not rely
+on `http_client` either: a grant alone cannot widen the memory adapter, which
+currently exposes no network surface.
 
 {{#include ../_snippets/plugin-build-component.md}}
 

@@ -6,10 +6,376 @@
 use std::path::Path;
 
 /// Platforms a step applies to. Renderers skip steps not in their set.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
     Unix,
     Windows,
+}
+
+/// Named user-facing installation paths. Renderers consume this route-level
+/// contract before choosing the lower-level install action plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteId {
+    UnixFast,
+    UnixGuided,
+    WindowsPrebuilt,
+    AdvancedSource,
+}
+
+/// How a user enters an installation route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Invocation {
+    PipedScript,
+    InteractiveScript,
+    ManualPrebuilt,
+    SourceScript,
+    CargoInstall,
+}
+
+impl Invocation {
+    /// Exact entry command for invocations whose command lives in this spec.
+    /// The Windows prebuilt route points to a maintained PowerShell block
+    /// instead of duplicating that release-sensitive script here.
+    pub fn command(self) -> Option<&'static str> {
+        match self {
+            Self::PipedScript => Some(
+                "curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh",
+            ),
+            Self::InteractiveScript => Some(
+                "git clone https://github.com/zeroclaw-labs/zeroclaw.git\ncd zeroclaw\n./install.sh",
+            ),
+            Self::ManualPrebuilt => None,
+            Self::SourceScript => Some("./install.sh --source"),
+            Self::CargoInstall => Some("cargo install --locked --path ."),
+        }
+    }
+}
+
+/// Whether the route permits interactive choices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interaction {
+    NonInteractive,
+    Guided,
+}
+
+/// Which install branch or branches the route can use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchPolicy {
+    PreferPrebuiltThenSource,
+    UserChoice,
+    PrebuiltOnly,
+    SourceOnly,
+}
+
+/// Which optional app policy applies to a route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppPolicy {
+    ArchiveOptional(&'static [&'static str]),
+    SourceDefaultsSelectable(&'static [&'static str]),
+    ArchiveOptionalOrSourceDefaults(&'static [&'static str]),
+    ArchiveOptionalOrSourceDefaultsSelectable(&'static [&'static str]),
+    CoreOnly,
+}
+
+impl AppPolicy {
+    pub fn selectable(self) -> bool {
+        matches!(
+            self,
+            Self::SourceDefaultsSelectable(_) | Self::ArchiveOptionalOrSourceDefaultsSelectable(_)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeaturePolicy {
+    Fixed,
+    Selectable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustPolicy {
+    NotRequired,
+    BootstrapIfMissing,
+    RequiredAheadOfTime,
+}
+
+/// The shell-visible result of adding the installed binaries to PATH.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathEffect {
+    ProfileUpdateRequiresReload,
+    CurrentAndFutureShell,
+    NoInstallerChange,
+}
+
+/// What the route offers immediately after installation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickstartHandoff {
+    PrintCommand,
+    OfferCliOrBrowser,
+    RunAutomatically,
+    RunExplicitly,
+}
+
+pub const QUICKSTART_COMMAND: &str = "zeroclaw quickstart";
+pub const ZEROCODE_APP: &str = "zerocode";
+
+/// Platform-specific first-run semantics within one user-visible route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallVariant {
+    pub platform: Platform,
+    pub invocation: Invocation,
+    pub interaction: Interaction,
+    pub branch: BranchPolicy,
+    pub apps: AppPolicy,
+    pub features: FeaturePolicy,
+    pub path_effect: PathEffect,
+    pub handoff: QuickstartHandoff,
+    pub quickstart_command: &'static str,
+    pub rust: RustPolicy,
+}
+
+impl InstallVariant {
+    fn validate(&self, route_id: RouteId) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !(matches!(self.interaction, Interaction::NonInteractive)
+                && matches!(self.branch, BranchPolicy::UserChoice)),
+            "non-interactive install route {:?} cannot require a user branch choice",
+            route_id
+        );
+
+        match self.branch {
+            BranchPolicy::PrebuiltOnly => anyhow::ensure!(
+                matches!(self.apps, AppPolicy::ArchiveOptional(_)),
+                "prebuilt-only install route {:?} must use ArchiveOptional",
+                route_id
+            ),
+            BranchPolicy::SourceOnly => anyhow::ensure!(
+                matches!(
+                    self.apps,
+                    AppPolicy::SourceDefaultsSelectable(_) | AppPolicy::CoreOnly
+                ),
+                "source-only install route {:?} must use a source app policy",
+                route_id
+            ),
+            BranchPolicy::PreferPrebuiltThenSource | BranchPolicy::UserChoice => anyhow::ensure!(
+                matches!(
+                    self.apps,
+                    AppPolicy::ArchiveOptionalOrSourceDefaults(_)
+                        | AppPolicy::ArchiveOptionalOrSourceDefaultsSelectable(_)
+                ),
+                "mixed-branch install route {:?} must use a mixed app policy",
+                route_id
+            ),
+        }
+
+        anyhow::ensure!(
+            !matches!(self.branch, BranchPolicy::PrebuiltOnly)
+                || self.features == FeaturePolicy::Fixed,
+            "prebuilt-only install route {:?} cannot expose feature selection",
+            route_id
+        );
+        anyhow::ensure!(
+            !(matches!(self.interaction, Interaction::NonInteractive)
+                && (self.apps.selectable() || self.features == FeaturePolicy::Selectable)),
+            "non-interactive install route {:?} cannot expose app or feature selection",
+            route_id
+        );
+        anyhow::ensure!(
+            !matches!(self.branch, BranchPolicy::SourceOnly)
+                || self.rust != RustPolicy::NotRequired,
+            "source-only install route {:?} must define how Rust is provided",
+            route_id
+        );
+        anyhow::ensure!(
+            self.invocation != Invocation::CargoInstall
+                || self.rust == RustPolicy::RequiredAheadOfTime,
+            "cargo-install route {:?} must require Rust ahead of time",
+            route_id
+        );
+        anyhow::ensure!(
+            self.quickstart_command == QUICKSTART_COMMAND,
+            "install route {:?} must use the canonical Quickstart command",
+            route_id
+        );
+        Ok(())
+    }
+}
+
+/// Canonical first-run semantics for one user-visible installation route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallRoute {
+    pub id: RouteId,
+    pub variants: &'static [InstallVariant],
+}
+
+impl InstallRoute {
+    pub fn variant(&self, platform: Platform) -> anyhow::Result<&InstallVariant> {
+        let mut variants = self
+            .variants
+            .iter()
+            .filter(|variant| variant.platform == platform);
+        let variant = variants.next().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "install route {:?} has no {:?} variant",
+                self.id, platform
+            ))
+        })?;
+        anyhow::ensure!(
+            variants.next().is_none(),
+            "install route {:?} has duplicate {:?} variants",
+            self.id,
+            platform
+        );
+        Ok(variant)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.variants.is_empty(),
+            "install route {:?} must define at least one platform variant",
+            self.id
+        );
+        for (index, variant) in self.variants.iter().enumerate() {
+            anyhow::ensure!(
+                !self.variants[..index]
+                    .iter()
+                    .any(|prior| prior.platform == variant.platform),
+                "install route {:?} has duplicate {:?} variants",
+                self.id,
+                variant.platform
+            );
+            variant.validate(self.id)?;
+        }
+        Ok(())
+    }
+}
+
+const ZEROCODE_APPS: &[&str] = &[ZEROCODE_APP];
+
+const UNIX_FAST_ROUTE: InstallRoute = InstallRoute {
+    id: RouteId::UnixFast,
+    variants: &[InstallVariant {
+        platform: Platform::Unix,
+        invocation: Invocation::PipedScript,
+        interaction: Interaction::NonInteractive,
+        branch: BranchPolicy::PreferPrebuiltThenSource,
+        apps: AppPolicy::ArchiveOptionalOrSourceDefaults(ZEROCODE_APPS),
+        features: FeaturePolicy::Fixed,
+        path_effect: PathEffect::ProfileUpdateRequiresReload,
+        handoff: QuickstartHandoff::PrintCommand,
+        quickstart_command: QUICKSTART_COMMAND,
+        rust: RustPolicy::BootstrapIfMissing,
+    }],
+};
+
+const UNIX_GUIDED_ROUTE: InstallRoute = InstallRoute {
+    id: RouteId::UnixGuided,
+    variants: &[InstallVariant {
+        platform: Platform::Unix,
+        invocation: Invocation::InteractiveScript,
+        interaction: Interaction::Guided,
+        branch: BranchPolicy::UserChoice,
+        apps: AppPolicy::ArchiveOptionalOrSourceDefaultsSelectable(ZEROCODE_APPS),
+        features: FeaturePolicy::Selectable,
+        path_effect: PathEffect::ProfileUpdateRequiresReload,
+        handoff: QuickstartHandoff::OfferCliOrBrowser,
+        quickstart_command: QUICKSTART_COMMAND,
+        rust: RustPolicy::BootstrapIfMissing,
+    }],
+};
+
+const WINDOWS_PREBUILT_ROUTE: InstallRoute = InstallRoute {
+    id: RouteId::WindowsPrebuilt,
+    variants: &[InstallVariant {
+        platform: Platform::Windows,
+        invocation: Invocation::ManualPrebuilt,
+        interaction: Interaction::NonInteractive,
+        branch: BranchPolicy::PrebuiltOnly,
+        apps: AppPolicy::ArchiveOptional(ZEROCODE_APPS),
+        features: FeaturePolicy::Fixed,
+        path_effect: PathEffect::CurrentAndFutureShell,
+        handoff: QuickstartHandoff::RunAutomatically,
+        quickstart_command: QUICKSTART_COMMAND,
+        rust: RustPolicy::NotRequired,
+    }],
+};
+
+const ADVANCED_SOURCE_ROUTE: InstallRoute = InstallRoute {
+    id: RouteId::AdvancedSource,
+    variants: &[
+        InstallVariant {
+            platform: Platform::Unix,
+            invocation: Invocation::SourceScript,
+            interaction: Interaction::Guided,
+            branch: BranchPolicy::SourceOnly,
+            apps: AppPolicy::SourceDefaultsSelectable(ZEROCODE_APPS),
+            features: FeaturePolicy::Selectable,
+            path_effect: PathEffect::ProfileUpdateRequiresReload,
+            handoff: QuickstartHandoff::OfferCliOrBrowser,
+            quickstart_command: QUICKSTART_COMMAND,
+            rust: RustPolicy::BootstrapIfMissing,
+        },
+        InstallVariant {
+            platform: Platform::Windows,
+            invocation: Invocation::CargoInstall,
+            interaction: Interaction::NonInteractive,
+            branch: BranchPolicy::SourceOnly,
+            apps: AppPolicy::CoreOnly,
+            features: FeaturePolicy::Fixed,
+            path_effect: PathEffect::NoInstallerChange,
+            handoff: QuickstartHandoff::RunExplicitly,
+            quickstart_command: QUICKSTART_COMMAND,
+            rust: RustPolicy::RequiredAheadOfTime,
+        },
+    ],
+};
+
+/// The canonical install routes, in the order user-facing renderers present
+/// them. Validation is fallible so callers receive contract errors rather than
+/// a process panic when a future route becomes inconsistent.
+pub fn install_routes() -> anyhow::Result<Vec<InstallRoute>> {
+    let routes = vec![
+        UNIX_FAST_ROUTE,
+        UNIX_GUIDED_ROUTE,
+        WINDOWS_PREBUILT_ROUTE,
+        ADVANCED_SOURCE_ROUTE,
+    ];
+    validate_install_routes(&routes)?;
+    Ok(routes)
+}
+
+pub fn validate_install_routes(routes: &[InstallRoute]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        routes.iter().map(|route| route.id).collect::<Vec<_>>()
+            == [
+                RouteId::UnixFast,
+                RouteId::UnixGuided,
+                RouteId::WindowsPrebuilt,
+                RouteId::AdvancedSource,
+            ],
+        "canonical install routes must contain each supported route exactly once in presentation order"
+    );
+    for route in routes {
+        route.validate()?;
+    }
+    for (route, expected_platforms) in routes.iter().zip([
+        &[Platform::Unix][..],
+        &[Platform::Unix][..],
+        &[Platform::Windows][..],
+        &[Platform::Unix, Platform::Windows][..],
+    ]) {
+        let actual: Vec<_> = route
+            .variants
+            .iter()
+            .map(|variant| variant.platform)
+            .collect();
+        anyhow::ensure!(
+            actual == expected_platforms,
+            "install route {:?} has an incomplete platform contract",
+            route.id
+        );
+    }
+    Ok(())
 }
 
 /// A value resolved from canonical sources, never a literal in a surface.
@@ -193,6 +559,19 @@ pub fn non_row_features(
 /// in the canonical registry rather than in release or packaging scripts.
 pub fn dist_extra_features(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<String>> {
     required_registry_list(pkg, "dist_extra_features")
+}
+
+/// Selections published across the canonical release workflow target matrix.
+/// On-demand selections remain available without adding release artifacts.
+pub fn release_distributions(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<String>> {
+    let selections = required_registry_list(pkg, "release_distributions")?;
+    for id in &selections {
+        anyhow::ensure!(
+            matches!(Selection::from_id(id), Some(Selection::Dist)),
+            "release_distributions supports the standard `dist` selection; `{id}` is on-demand only"
+        );
+    }
+    Ok(selections)
 }
 
 /// Target-specific compatibility exclusions for standard distribution builds.
@@ -439,7 +818,22 @@ pub fn resolve_feature_list(
     resolve_feature_list_from_package(&meta, root, selection)
 }
 
-fn workspace_root_package(
+/// Concrete feature leaves the canonical registry keeps out of
+/// `Selection::Dist`.
+///
+/// Leanness tests assert against this derived set instead of naming a sentinel
+/// feature, so promoting a channel into `dist_extra_features` stays a
+/// one-line registry edit and never requires touching a test.
+#[cfg(test)]
+pub(crate) fn features_outside_dist(manifest_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let dist = resolve_feature_list(manifest_dir, &Selection::Dist)?;
+    Ok(resolve_feature_list(manifest_dir, &Selection::All)?
+        .into_iter()
+        .filter(|feature| !dist.contains(feature))
+        .collect())
+}
+
+pub(super) fn workspace_root_package(
     meta: &cargo_metadata::Metadata,
 ) -> anyhow::Result<&cargo_metadata::Package> {
     meta.root_package()
@@ -467,7 +861,7 @@ fn resolve_feature_list_from_package(
 }
 
 /// Resolve a selection and apply the registry-owned compatibility policy for
-/// one build target. Target policy is defined only for the Dist selection.
+/// one build target. Target policy is defined only for distribution selections.
 pub fn resolve_feature_list_for_target(
     manifest_dir: &Path,
     selection: &Selection,
@@ -484,8 +878,11 @@ pub fn resolve_feature_list_for_target(
     };
     anyhow::ensure!(!target.is_empty(), "target must not be empty");
     anyhow::ensure!(
-        matches!(selection, Selection::Dist),
-        "target-specific exclusions are only defined for the dist selection"
+        matches!(
+            selection,
+            Selection::Dist | Selection::DistBroad | Selection::DistCompat
+        ),
+        "target-specific exclusions are only defined for distribution selections"
     );
 
     let exclusions = dist_target_exclusions(root)?;
@@ -493,7 +890,7 @@ pub fn resolve_feature_list_for_target(
         for feature in excluded {
             anyhow::ensure!(
                 features.iter().any(|candidate| candidate == feature),
-                "dist_target_exclusions.{configured_target} names `{feature}`, which is not in the dist selection"
+                "dist_target_exclusions.{configured_target} names `{feature}`, which is not in the selected distribution"
             );
         }
     }
@@ -587,10 +984,16 @@ pub enum Selection {
     Full,
     /// Kernel only (`--no-default-features`).
     Minimal,
-    /// Standard binary distribution: lean Cargo defaults plus the explicit
-    /// registry-owned distribution additions. The set a single-artifact
-    /// package manager ships.
+    /// Standard binary distribution: Cargo defaults plus registry-owned
+    /// channels, plugin hosts and native adapters. Runtime tool selection
+    /// defaults to minimal; full uses the same artifact.
     Dist,
+    /// Measurement-only broad distribution: `Dist` plus the canonical
+    /// `channels-full` aggregate. Not offered by installer menus until a
+    /// stable broad artifact lifecycle exists.
+    DistBroad,
+    /// Compatibility alias for the standard distribution.
+    DistCompat,
     /// Every selectable feature (all − non_row − pure-alias). The docker
     /// `:all-features` kitchen sink.
     All,
@@ -606,6 +1009,8 @@ impl Selection {
             Selection::Full => "default",
             Selection::Minimal => "minimal",
             Selection::Dist => "dist",
+            Selection::DistBroad => "dist-broad",
+            Selection::DistCompat => "dist-compat",
             Selection::All => "all",
             Selection::Features(_) => "custom",
         }
@@ -617,22 +1022,39 @@ impl Selection {
         match self {
             Selection::Full => "default feature set",
             Selection::Minimal => "core only, no default features",
-            Selection::Dist => "lean standard distribution (recommended)",
+            Selection::Dist => "standard distribution, minimal/full tools (recommended)",
+            Selection::DistBroad => "broad-channel distribution measurement build",
+            Selection::DistCompat => "standard distribution compatibility alias",
             Selection::All => "every feature including hardware and browser",
             Selection::Features(_) => "custom feature selection",
         }
     }
 
-    /// The selections a packaged/menu surface offers, in menu order. Single
-    /// source for "which build modes exist"; surfaces walk this, they do not
-    /// enumerate modes themselves.
-    pub fn menu() -> Vec<Selection> {
+    /// Every named selection accepted by the feature resolver.
+    pub fn named() -> Vec<Selection> {
         vec![
             Selection::Minimal,
             Selection::Dist,
+            Selection::DistBroad,
+            Selection::DistCompat,
             Selection::Full,
             Selection::All,
         ]
+    }
+
+    /// The selections a packaged/menu surface offers, in menu order.
+    pub fn menu() -> Vec<Selection> {
+        Self::named()
+            .into_iter()
+            .filter(|selection| !matches!(selection, Selection::DistBroad | Selection::DistCompat))
+            .collect()
+    }
+
+    /// Resolve a named build selection without coupling it to installer menus.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::named()
+            .into_iter()
+            .find(|selection| selection.id() == id)
     }
 
     /// Cargo flag string for this selection (wraps `to_feature_list`).
@@ -650,14 +1072,21 @@ impl Selection {
         let mut set = match self {
             Selection::Minimal => Vec::new(),
             Selection::Full => ctx.expand("default"),
-            Selection::Dist => {
+            Selection::Dist | Selection::DistBroad | Selection::DistCompat => {
                 let mut s = ctx.expand("default");
                 for feature in ctx.dist_extra {
                     anyhow::ensure!(
                         ctx.all.contains(feature),
                         "unknown dist_extra_features entry `{feature}` (not in [features])"
                     );
-                    s.push(feature.clone());
+                    if ctx.non_row.contains(feature) {
+                        s.extend(ctx.expand(feature));
+                    } else {
+                        s.push(feature.clone());
+                    }
+                }
+                if matches!(self, Selection::DistBroad) {
+                    s.extend(ctx.expand("channels-full"));
                 }
                 s
             }
@@ -773,6 +1202,277 @@ mod tests {
             .to_path_buf()
     }
 
+    fn route(routes: &[InstallRoute], id: RouteId) -> &InstallRoute {
+        routes
+            .iter()
+            .find(|route| route.id == id)
+            .unwrap_or_else(|| panic!("missing install route {id:?}"))
+    }
+
+    fn mutated_variant(
+        route: &InstallRoute,
+        platform: Platform,
+        mutate: impl FnOnce(&mut InstallVariant),
+    ) -> InstallRoute {
+        let mut variants = route.variants.to_vec();
+        mutate(
+            variants
+                .iter_mut()
+                .find(|variant| variant.platform == platform)
+                .unwrap(),
+        );
+        InstallRoute {
+            variants: Box::leak(variants.into_boxed_slice()),
+            ..*route
+        }
+    }
+
+    #[test]
+    fn install_routes_cover_the_four_user_paths() {
+        let routes = install_routes().unwrap();
+
+        assert_eq!(
+            routes.iter().map(|route| route.id).collect::<Vec<_>>(),
+            vec![
+                RouteId::UnixFast,
+                RouteId::UnixGuided,
+                RouteId::WindowsPrebuilt,
+                RouteId::AdvancedSource,
+            ]
+        );
+    }
+
+    #[test]
+    fn install_route_contract_rejects_impossible_combinations() {
+        let routes = install_routes().unwrap();
+
+        let non_interactive_user_choice = mutated_variant(
+            route(&routes, RouteId::UnixGuided),
+            Platform::Unix,
+            |variant| variant.interaction = Interaction::NonInteractive,
+        );
+        assert!(
+            non_interactive_user_choice
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot require a user branch choice")
+        );
+
+        for non_interactive_selection in [
+            mutated_variant(
+                route(&routes, RouteId::UnixFast),
+                Platform::Unix,
+                |variant| {
+                    variant.apps =
+                        AppPolicy::ArchiveOptionalOrSourceDefaultsSelectable(ZEROCODE_APPS);
+                },
+            ),
+            mutated_variant(
+                route(&routes, RouteId::UnixFast),
+                Platform::Unix,
+                |variant| {
+                    variant.features = FeaturePolicy::Selectable;
+                },
+            ),
+        ] {
+            assert!(
+                non_interactive_selection
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot expose app or feature selection")
+            );
+        }
+
+        let prebuilt_with_feature_selection = mutated_variant(
+            route(&routes, RouteId::WindowsPrebuilt),
+            Platform::Windows,
+            |variant| variant.features = FeaturePolicy::Selectable,
+        );
+        assert!(
+            prebuilt_with_feature_selection
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains(
+                    "prebuilt-only install route WindowsPrebuilt cannot expose feature selection"
+                )
+        );
+
+        let mut missing_platform = routes.clone();
+        let source = route(&missing_platform, RouteId::AdvancedSource);
+        let unix_only = [*source.variant(Platform::Unix).unwrap()];
+        missing_platform
+            .iter_mut()
+            .find(|route| route.id == RouteId::AdvancedSource)
+            .unwrap()
+            .variants = Box::leak(Box::new(unix_only));
+        assert!(
+            validate_install_routes(&missing_platform)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete platform contract")
+        );
+    }
+
+    #[test]
+    fn install_route_contract_rejects_incompatible_app_policy_and_selection() {
+        let routes = install_routes().unwrap();
+
+        let incompatible_mixed_branch_policy = mutated_variant(
+            route(&routes, RouteId::UnixFast),
+            Platform::Unix,
+            |variant| variant.apps = AppPolicy::ArchiveOptional(ZEROCODE_APPS),
+        );
+        assert!(
+            incompatible_mixed_branch_policy
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("mixed-branch install route UnixFast must use a mixed app policy")
+        );
+
+        let source_with_archive_policy = mutated_variant(
+            route(&routes, RouteId::AdvancedSource),
+            Platform::Unix,
+            |variant| variant.apps = AppPolicy::ArchiveOptional(ZEROCODE_APPS),
+        );
+        assert!(
+            source_with_archive_policy
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("source-only install route AdvancedSource must use a source app policy")
+        );
+
+        let archive_with_app_selection = mutated_variant(
+            route(&routes, RouteId::WindowsPrebuilt),
+            Platform::Windows,
+            |variant| variant.apps = AppPolicy::SourceDefaultsSelectable(ZEROCODE_APPS),
+        );
+        assert!(
+            archive_with_app_selection
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("prebuilt-only install route WindowsPrebuilt must use ArchiveOptional")
+        );
+    }
+
+    #[test]
+    fn standard_distribution_carries_full_adapters_and_compat_is_an_alias() {
+        let dist = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        let compat = resolve_feature_list(&root(), &Selection::DistCompat).unwrap();
+        let optional =
+            resolve_feature_list(&root(), &Selection::Features(vec!["tools-compat".into()]))
+                .unwrap();
+        assert!(
+            resolve_feature_list(&root(), &Selection::Full)
+                .unwrap()
+                .iter()
+                .all(|feature| !feature.starts_with("tool-") && feature != "tools-external")
+        );
+        for tool in zeroclaw_config::opt_in_tools::OptInTool::ALL {
+            assert!(compat.iter().any(|candidate| candidate == tool.feature()));
+        }
+        assert!(compat.contains(&"tools-external".to_string()));
+        assert_eq!(dist, compat);
+        assert!(optional.contains(&"tools-compat".to_string()));
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert!(
+                !resolve_feature_list_for_target(&root(), &Selection::DistCompat, Some(target))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let desktop =
+            std::fs::read_to_string(root().join("scripts/desktop/prepare-kernel.sh")).unwrap();
+        assert!(desktop.contains("--selection \"$DISTRIBUTION\" --target \"$triple\""));
+        assert!(desktop.contains("--no-default-features"));
+    }
+
+    #[test]
+    fn distributions_keep_supported_portable_plugin_hosts_without_default_activation() {
+        let defaults = resolve_feature_list(&root(), &Selection::Full).unwrap();
+        assert!(
+            !defaults
+                .iter()
+                .any(|feature| feature.starts_with("plugins-wasm"))
+        );
+        let config = zeroclaw_config::schema::Config::default();
+        assert!(!config.plugins.enabled);
+        assert!(!config.plugins.auto_discover);
+
+        for selection in [Selection::Dist, Selection::DistCompat] {
+            for target in [
+                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-gnu",
+                "aarch64-unknown-linux-musl",
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+            ] {
+                let features =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert!(features.contains(&"agent-runtime".into()));
+                assert!(
+                    features.contains(&"plugins-wasm-cranelift".into()),
+                    "{target}"
+                );
+            }
+            for target in [
+                "arm-unknown-linux-gnueabihf",
+                "armv7-unknown-linux-gnueabihf",
+                "aarch64-linux-android",
+            ] {
+                let features =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert!(
+                    !features.contains(&"plugins-wasm-cranelift".into()),
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn install_route_contract_rejects_duplicate_platforms() {
+        let routes = install_routes().unwrap();
+        let fast = route(&routes, RouteId::UnixFast);
+        let duplicate_platforms = InstallRoute {
+            variants: Box::leak(vec![fast.variants[0], fast.variants[0]].into_boxed_slice()),
+            ..*fast
+        };
+
+        assert!(
+            duplicate_platforms
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("install route UnixFast has duplicate Unix variants")
+        );
+    }
+
+    #[test]
+    fn unix_fast_and_guided_have_distinct_handoffs() {
+        let routes = install_routes().unwrap();
+        let fast = route(&routes, RouteId::UnixFast);
+        let guided = route(&routes, RouteId::UnixGuided);
+        let fast = fast.variant(Platform::Unix).unwrap();
+        let guided = guided.variant(Platform::Unix).unwrap();
+
+        assert_eq!(fast.interaction, Interaction::NonInteractive);
+        assert_eq!(fast.handoff, QuickstartHandoff::PrintCommand);
+        assert_eq!(guided.interaction, Interaction::Guided);
+        assert_eq!(guided.handoff, QuickstartHandoff::OfferCliOrBrowser);
+    }
+
     #[test]
     fn reads_non_row_from_registry_not_hardcoded() {
         let meta = cargo_metadata::MetadataCommand::new()
@@ -803,6 +1503,7 @@ mod tests {
             "aggregates must expand, not appear as leaves"
         );
         assert!(r.default_features.contains(&"gateway".to_string()));
+        assert!(!r.default_features.contains(&"channel-git".to_string()));
     }
 
     #[test]
@@ -827,21 +1528,85 @@ mod tests {
         );
     }
 
+    /// Pins the shipping contract by name on purpose: widening `dist` must be a
+    /// deliberate, reviewed edit here, not a silent consequence of a registry
+    /// change. The generator suites derive their expectations from the
+    /// registry; this one stays the policy tripwire.
     #[test]
-    fn dist_matches_lean_release_contract() {
+    fn dist_matches_minimal_full_release_contract() {
         let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        assert!(features.contains(&"channel-git".to_string()));
         let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
-        expected.extend(["channel-matrix", "channel-lark", "whatsapp-web"].map(str::to_owned));
+        expected.extend(
+            [
+                "channel-matrix",
+                "channel-lark",
+                "channel-git",
+                "whatsapp-web",
+                "plugins-wasm-cranelift",
+            ]
+            .map(str::to_owned),
+        );
+        expected.extend(
+            zeroclaw_config::opt_in_tools::OptInTool::ALL.map(|tool| tool.feature().to_string()),
+        );
+        expected.push("tools-external".into());
         expected.sort();
         expected.dedup();
         assert_eq!(features, expected);
     }
 
     #[test]
+    fn dist_broad_derives_membership_from_channels_full() {
+        let meta = cargo_metadata::MetadataCommand::new()
+            .manifest_path(root().join("Cargo.toml"))
+            .no_deps()
+            .exec()
+            .unwrap();
+        let pkg = workspace_root_package(&meta).unwrap();
+        let all_features: Vec<String> = pkg.features.keys().cloned().collect();
+        let non_row = non_row_features(&meta, pkg);
+        let dist_extra = dist_extra_features(pkg).unwrap();
+        let container_excluded = container_excluded_features(pkg);
+        let ctx = FeatureCtx {
+            graph: &pkg.features,
+            all: &all_features,
+            non_row: &non_row,
+            dist_extra: &dist_extra,
+            container_excluded: &container_excluded,
+        };
+
+        let mut expected = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        expected.extend(ctx.expand("channels-full"));
+        expected.sort();
+        expected.dedup();
+
+        let broad = resolve_feature_list(&root(), &Selection::DistBroad).unwrap();
+        assert_eq!(broad, expected);
+        assert!(broad.contains(&"channel-slack".to_string()));
+        assert!(!broad.contains(&"hardware".to_string()));
+    }
+
+    #[test]
+    fn dist_broad_is_named_but_not_offered_in_installer_menus() {
+        assert_eq!(Selection::DistBroad.id(), "dist-broad");
+        assert!(matches!(
+            Selection::from_id("dist-broad"),
+            Some(Selection::DistBroad)
+        ));
+        assert!(Selection::from_id("unknown-selection").is_none());
+        assert!(
+            Selection::menu()
+                .iter()
+                .all(|selection| selection.id() != Selection::DistBroad.id())
+        );
+    }
+
+    #[test]
     fn all_is_superset_of_dist() {
         let dist = resolve(&root(), &Selection::Dist).unwrap();
         let all = resolve(&root(), &Selection::All).unwrap();
-        // All includes optional features outside the lean distribution.
+        // All includes optional features outside the standard distribution.
         assert!(
             all.cargo_flags.contains("hardware"),
             "all is the kitchen sink"
@@ -867,6 +1632,7 @@ mod tests {
             "distribution extras come from Cargo.toml registry"
         );
         assert!(extras.contains(&"channel-lark".to_string()));
+        assert!(extras.contains(&"channel-git".to_string()));
         assert!(extras.contains(&"whatsapp-web".to_string()));
     }
 
@@ -907,16 +1673,19 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        for (target, excluded) in &exclusions {
-            let resolved =
-                resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
-            assert_eq!(resolved.len(), dist.len() - excluded.len());
-            for feature in &dist {
-                assert_eq!(
-                    resolved.contains(feature),
-                    !excluded.contains(feature),
-                    "unexpected resolution for {target}: {feature}"
-                );
+        for selection in [Selection::Dist, Selection::DistBroad, Selection::DistCompat] {
+            let unfiltered = resolve_feature_list(&root(), &selection).unwrap();
+            for (target, excluded) in &exclusions {
+                let resolved =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert_eq!(resolved.len(), unfiltered.len() - excluded.len());
+                for feature in &unfiltered {
+                    assert_eq!(
+                        resolved.contains(feature),
+                        !excluded.contains(feature),
+                        "unexpected resolution for {target}: {feature}"
+                    );
+                }
             }
         }
 
@@ -928,7 +1697,9 @@ mod tests {
         .unwrap();
         assert_eq!(host, dist);
 
-        assert!(exclude_features(host, &["channel-slack".to_owned()]).is_err());
+        let outside_dist = features_outside_dist(&root()).unwrap();
+        let not_in_dist = outside_dist.first().expect("dist is not the kitchen sink");
+        assert!(exclude_features(host, std::slice::from_ref(not_in_dist)).is_err());
         let (target, excluded) = exclusions.iter().next().unwrap();
         let resolved =
             resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
@@ -944,14 +1715,17 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        assert_eq!(exclusions["aarch64-linux-android"], vec!["whatsapp-web"]);
+        assert_eq!(
+            exclusions["aarch64-linux-android"],
+            vec!["whatsapp-web", "plugins-wasm-cranelift"]
+        );
         assert_eq!(
             exclusions["arm-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
         assert_eq!(
             exclusions["armv7-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
     }
 
@@ -963,25 +1737,313 @@ mod tests {
             .exec()
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
-        for workflow in [
-            ".github/workflows/cross-platform-build-manual.yml",
-            ".github/workflows/release-stable-manual.yml",
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        let shared = std::fs::read_to_string(
+            root().join(".github/actions/build-release-payloads/action.yml"),
+        )
+        .unwrap();
+        assert!(shared.contains("RELEASE_TARGET: ${{ inputs.target }}"));
+        assert!(shared.contains("features --selection dist --target \"$RELEASE_TARGET\""));
+        assert!(!release.contains("excluded_features"));
+        // The stable release build MUST pin --no-default-features against the
+        // generator's explicit per-target list, exactly like the manual workflow.
+        // Omitting it (or branching on an undefined matrix field) unions the root
+        // crate defaults back in and silently re-enables a target-excluded default
+        // feature (e.g. observability-prometheus on ARM). The excluded-feature
+        // string checks below do NOT catch that, since the leaked feature never
+        // appears as a literal in the workflow.
+        assert!(
+            shared.contains(
+                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target \"$RELEASE_TARGET\""
+            ),
+            "the stable release build must pin --no-default-features so target-excluded default features cannot leak back in"
+        );
+        assert!(
+            !release.contains("skip_prometheus"),
+            "the stable release build must not branch on an undefined skip_prometheus matrix field"
+        );
+        let cross_install = "- name: Install cross (MUSL targets)\n        if: matrix.use_cross\n        run: bash scripts/ci/install_release_tool.sh cross";
+        assert!(release.contains(cross_install));
+        assert!(!release.contains("cargo install cross"));
+        assert_eq!(
+            release
+                .matches("run: bash scripts/ci/install_release_tool.sh tauri-cli")
+                .count(),
+            3,
+            "all three desktop release jobs must use the pinned installer"
+        );
+        assert!(!release.contains("cargo install tauri-cli"));
+
+        let manual = std::fs::read_to_string(
+            root().join(".github/workflows/cross-platform-build-manual.yml"),
+        )
+        .unwrap();
+        assert!(manual.contains("distribution:"));
+        assert!(
+            manual.contains(
+                "default: dist\n        options:\n          - dist\n          - dist-broad"
+            )
+        );
+        for (document, job, emit) in [
+            (&release, "  build:\n", "false"),
+            (&manual, "  stable-gnu-build:\n", "true"),
         ] {
-            let contents = std::fs::read_to_string(root().join(workflow)).unwrap();
-            assert!(
-                contents.contains("features --selection dist --target \"${{ matrix.target }}\""),
-                "{workflow} must pass the target triple to the canonical feature resolver"
-            );
-            assert!(
-                !contents.contains("excluded_features"),
-                "{workflow} must not own a parallel target exclusion policy"
-            );
-            for feature in exclusions.values().flatten() {
+            let caller = job_block(job_block(document, job), "      - name: Build release\n");
+            assert!(caller.contains("uses: ./.github/actions/build-release-payloads"));
+            for binding in [
+                "target: ${{ matrix.target }}",
+                "linker_env: ${{ matrix.linker_env || '' }}",
+                "linker: ${{ matrix.linker || '' }}",
+                "use_cross: ${{ matrix.use_cross || 'false' }}",
+            ] {
                 assert!(
-                    !contents.contains(feature),
-                    "{workflow} must not name target-excluded feature {feature}"
+                    caller.contains(binding),
+                    "missing shared-recipe binding: {binding}"
                 );
             }
+            assert!(caller.contains(&format!("emit_features: '{emit}'")));
+            assert!(!caller.contains("run:") && !caller.contains("shell:"));
+        }
+        let normal = job_block(&manual, "  build:\n");
+        assert!(normal.contains(
+            "\n    timeout-minutes: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin') && 180 || 90 }}\n"
+        ));
+        assert!(normal.contains("--selection \"${{ inputs.distribution }}\""));
+        assert!(normal.contains("echo \"- Binary bytes: $bytes\""));
+        assert!(normal.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
+        assert!(normal.contains("echo \"- SHA-256: $sha256\""));
+        for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
+            assert!(normal.contains(&format!(
+                "- os: ubuntu-latest\n            target: {target}\n            use_cross: true"
+            )));
+        }
+        assert!(normal.contains(cross_install));
+        assert!(!normal.contains("cargo install cross"));
+        assert!(normal.contains(
+            "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build${dist_build_jobs}\""
+        ));
+        assert!(normal.contains("echo \"BUILD_CMD=cargo build${dist_build_jobs}\""));
+        assert!(normal.contains(
+            "prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n          cache-targets: false\n          save-if: ${{ github.ref == 'refs/heads/master' }}"
+        ));
+        assert!(normal.contains(
+            "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
+        ));
+        assert!(normal.contains(
+            "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
+        ));
+        assert!(normal.contains(
+            "run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}"
+        ));
+        assert_eq!(
+            normal
+                .matches("if: matrix.target != 'aarch64-linux-android'")
+                .count(),
+            4,
+            "the ZeroCode and ZeroRelay builds and uploads must all skip Android"
+        );
+        assert!(!normal.contains("excluded_features"));
+
+        let target_env = normal.find("- name: Configure target environment").unwrap();
+        let release_step = normal.find("- name: Build release").unwrap();
+        let zeroclaw_upload = normal
+            .find("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
+            .unwrap();
+        let companion = normal.find("- name: Build ZeroCode companion").unwrap();
+        assert!(
+            target_env < release_step
+                && release_step < zeroclaw_upload
+                && zeroclaw_upload < companion
+        );
+        assert!(
+            normal[target_env..release_step]
+                .contains("echo \"${{ matrix.linker_env }}=${{ matrix.linker }}\"")
+        );
+        assert!(normal[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
+        assert!(!normal[release_step..companion].contains("matrix.linker_env"));
+
+        let stable_build = job_block(&release, "  build:\n");
+        assert_eq!(
+            stable_build
+                .matches("run: bash scripts/ci/package_release_archive.sh")
+                .count(),
+            2,
+            "both Stable platform steps must consume the one shared archive writer"
+        );
+        assert!(!stable_build.contains("mkdir -p staging/web"));
+        let manual_build = job_block(&manual, "  build:\n");
+        assert!(manual_build.contains("BINARY_SIZE_HARD_LIMIT: \"83886080\""));
+        assert!(
+            manual_build.contains(
+                "bash scripts/ci/package_release_archive.sh \"$target\" \"$main\" \"$ext\" \"$RUNNER_OS\""
+            )
+        );
+        assert!(
+            manual_build
+                .contains("--web-dist web/dist --source \"$GITHUB_SHA\" --target \"$target\"")
+        );
+        assert!(manual_build.contains("--output archive-evidence/input-manifest.json"));
+        assert!(
+            manual_build.contains("--run \"$GITHUB_RUN_ID\" --attempt \"$GITHUB_RUN_ATTEMPT\"")
+        );
+        assert!(manual_build.contains("if [ \"$target\" != aarch64-linux-android ]; then"));
+        let native_smoke = job_block(&manual, "  plugin-smoke:\n");
+        assert!(native_smoke.contains("if: inputs.distribution != 'dist'"));
+        assert!(
+            native_smoke
+                .contains("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
+        );
+        assert!(native_smoke.contains("name: zeroclaw-manual-archive-dist-${{ matrix.target }}"));
+        assert!(
+            native_smoke
+                .contains("--expected-source \"$GITHUB_SHA\" --expected-target \"$target\"")
+        );
+        assert!(native_smoke.contains(
+            "--expected-run \"$GITHUB_RUN_ID\" --expected-attempt \"$GITHUB_RUN_ATTEMPT\""
+        ));
+        assert!(native_smoke.contains("archive_args=(--archive \"$SMOKE_ARCHIVE\")"));
+        assert!(native_smoke.contains("SMOKE_ARCHIVE: ${{ steps.archive.outputs.archive }}"));
+        assert!(native_smoke.contains("${archive_args[@]+\"${archive_args[@]}\"}"));
+        assert!(
+            native_smoke.find("Run scripted provider tests").unwrap()
+                < native_smoke
+                    .find("Run the plugin smoke against the built binary")
+                    .unwrap()
+        );
+
+        for feature in exclusions.values().flatten() {
+            assert!(!release.contains(feature));
+            assert!(!manual.contains(feature));
+            assert!(!shared.contains(feature));
+        }
+    }
+
+    /// One job's YAML block: from its header line to the next line at the
+    /// same or a shallower indent.
+    fn job_block<'a>(document: &'a str, header: &str) -> &'a str {
+        let header_indent = header.len() - header.trim_start().len();
+        let start = document
+            .match_indices(header)
+            .find_map(|(offset, _)| {
+                (offset == 0 || document.as_bytes().get(offset - 1) == Some(&b'\n'))
+                    .then_some(offset)
+            })
+            .unwrap_or_else(|| panic!("workflow is missing YAML block: {header}"));
+        let remainder = &document[start + header.len()..];
+        let mut offset = 0;
+        for line in remainder.split_inclusive('\n') {
+            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') && indent <= header_indent {
+                return &remainder[..offset];
+            }
+            offset += line.len();
+        }
+        remainder
+    }
+
+    #[test]
+    fn workflow_job_block_retains_outdented_comments_until_the_next_job() {
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        assert!(release.contains("\n# >>> end generated:release-distributions <<<\n"));
+        let build = job_block(&release, "  build:\n");
+        assert!(build.contains("uses: ./.github/actions/build-release-payloads"));
+        assert_eq!(matrix_targets(build).len(), 10);
+        assert!(!build.contains("  build-desktop:\n"));
+        let annotated = release.replacen(
+            "\n  build-desktop:\n",
+            "\n# comment before the next real job\n  build-desktop:\n",
+            1,
+        );
+        assert_ne!(annotated, release);
+        let retained = job_block(&annotated, "  build:\n");
+        assert!(retained.contains("# comment before the next real job"));
+        assert_eq!(matrix_targets(retained), matrix_targets(build));
+        assert!(retained.contains("uses: ./.github/actions/build-release-payloads"));
+        assert!(!retained.contains("  build-desktop:\n"));
+    }
+
+    /// The `target:` entries of one job's matrix, whether an entry starts
+    /// with the target or lists it after another field.
+    fn matrix_targets(job: &str) -> Vec<String> {
+        job_block(job_block(job, "    strategy:\n"), "      matrix:\n")
+            .lines()
+            .map(|line| line.trim())
+            .map(|line| line.strip_prefix("- ").unwrap_or(line))
+            .filter_map(|line| line.strip_prefix("target: "))
+            .filter(|target| !target.trim_start().starts_with('['))
+            .map(|target| target.trim().to_owned())
+            .collect()
+    }
+
+    /// A release target carries a plugin backend exactly when the stable
+    /// release executes a plugin from that target's archive. A target cannot
+    /// claim plugin support without that proof, and a smoke leg cannot be
+    /// dropped while the artifact still carries the host. The manual
+    /// cross-platform workflow rehearses the same legs.
+    #[test]
+    fn release_targets_carry_a_plugin_backend_only_with_a_smoke_leg() {
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        let manual = std::fs::read_to_string(
+            root().join(".github/workflows/cross-platform-build-manual.yml"),
+        )
+        .unwrap();
+        let build_targets = matrix_targets(job_block(&release, "  build:\n"));
+        let smoke_targets = matrix_targets(job_block(&release, "  plugin-smoke:\n"));
+        assert!(!build_targets.is_empty(), "no release build legs parsed");
+        assert!(!smoke_targets.is_empty(), "no plugin smoke legs parsed");
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  plugin-smoke:\n")),
+            smoke_targets,
+            "the manual workflow must rehearse exactly the release smoke legs"
+        );
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  stable-gnu-build:\n")),
+            [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "armv7-unknown-linux-gnueabihf",
+                "arm-unknown-linux-gnueabihf",
+            ]
+        );
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  stable-gnu-plugin-smoke:\n")),
+            ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+        );
+        let release_build = job_block(&release, "  build:\n");
+        for outside in ["outside-matrix", "x86_64-unknown-linux-gnu"] {
+            let contaminated = release_build.replacen(
+                "target: ${{ matrix.target }}",
+                &format!("target: {outside}"),
+                1,
+            );
+            assert_ne!(contaminated, release_build);
+            assert_eq!(matrix_targets(&contaminated), build_targets);
+        }
+        for target in &smoke_targets {
+            assert!(
+                build_targets.contains(target),
+                "plugin smoke leg {target} has no release build leg"
+            );
+        }
+        for target in &build_targets {
+            let features =
+                resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
+            let carries_backend = features
+                .iter()
+                .any(|feature| feature.starts_with("plugins-wasm"));
+            assert_eq!(
+                carries_backend,
+                smoke_targets.contains(target),
+                "{target}: a plugin backend in the distribution set ({carries_backend}) must \
+                 come with a release smoke leg, and only then"
+            );
         }
     }
 

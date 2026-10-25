@@ -2,11 +2,14 @@
 
 pub mod model;
 pub mod sqlite;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::sop::types::SopRunStatus;
 use zeroclaw_config::schema::{SopConfig, SopRunStoreBackend};
 
 pub use model::{
@@ -20,13 +23,55 @@ pub trait SopRunStore: Send + Sync {
     /// Persist-before-mutate. Revision-guarded: a strictly-older revision is
     /// rejected as `StaleRevision`; an equal revision is accepted only as a
     /// byte-identical idempotent retry, else `RevisionConflict`; a newer
-    /// revision wins.
+    /// revision wins. A run whose terminal record is stored is never reopened:
+    /// every active write to it is `TerminalRun`.
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError>;
+    /// Persist a parked approval/checkpoint run only if this SOP still has room
+    /// in its pending pool. Returns `Ok(false)` without saving when the pool is
+    /// full. Store implementations should make the count and save one atomic
+    /// critical section; the default preserves compatibility for test wrappers.
+    fn save_run_with_pending_capacity(
+        &self,
+        run: &PersistedRun,
+        max_pending: usize,
+    ) -> Result<bool, StoreError> {
+        if max_pending > 0 {
+            let pending = self
+                .load_active_runs()?
+                .into_iter()
+                .filter(|existing| pending_capacity_member(existing, run))
+                .count();
+            if pending >= max_pending {
+                return Ok(false);
+            }
+        }
+        self.save_run(run)?;
+        Ok(true)
+    }
+    /// Persist an active run transition and append its audit event as one store
+    /// outcome. Implementations must make both writes visible together or neither
+    /// visible at all; callers use this for approval gate resolution so a durable
+    /// `gate_resolved` row cannot exist without the run transition it authorizes.
+    fn save_run_with_event(
+        &self,
+        run: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError>;
     /// Move a run to terminal state (kept as a terminal record, not deleted) and
     /// release any live claim. Revision-guarded exactly like `save_run`, so a
     /// stale or divergent terminal write cannot clobber newer state or release a
-    /// live claim.
+    /// live claim. A stored terminal record is final: only a byte-identical retry
+    /// of it is accepted, anything else is `TerminalRun`.
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError>;
+    /// Move a run to terminal state and append its audit event as one store
+    /// outcome. Claim release is part of the terminal transition and must be in
+    /// the same atomic boundary as the audit append.
+    fn finish_run_with_event(
+        &self,
+        run_id: &str,
+        terminal: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError>;
     /// Boot-rehydrate source: every non-terminal run (latest revision per id).
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError>;
     /// Boot-rehydrate source for the display retention window: terminal runs,
@@ -55,6 +100,17 @@ pub trait SopRunStore: Send + Sync {
         run_id: &str,
         sop_name: &str,
     ) -> Result<ClaimToken, StoreError>;
+    /// Mark an existing live claim as intentionally retained while a failed
+    /// terminal checkpoint decision is retried. No-op if the claim is already
+    /// gone; the caller is already failing closed on the original transition.
+    fn mark_claim_retained_after_terminal_rollback(&self, _run_id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Whether the live claim for `run_id` is an intentional terminal-rollback
+    /// retention marker rather than a stale parked claim from old behavior.
+    fn has_retained_terminal_rollback_claim(&self, _run_id: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Live claim counts as `(for_sop, total)`, used by read-only admission
     /// checks so status surfaces observe the same concurrency source as CAS.
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError>;
@@ -87,6 +143,17 @@ pub trait SopRunStore: Send + Sync {
     fn backend(&self) -> &'static str;
 }
 
+pub(crate) const RETAINED_TERMINAL_ROLLBACK_HOLDER: &str = "engine:terminal-rollback-retained";
+
+pub(super) fn pending_capacity_member(existing: &PersistedRun, incoming: &PersistedRun) -> bool {
+    existing.run_id() != incoming.run_id()
+        && existing.run.sop_name == incoming.run.sop_name
+        && matches!(
+            existing.run.status,
+            SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+        )
+}
+
 /// Errors a store may surface. Never swallowed by callers.
 #[derive(Debug)]
 pub enum StoreError {
@@ -105,6 +172,11 @@ pub enum StoreError {
     RevisionConflict {
         run_id: String,
         revision: u64,
+    },
+    /// A write to a run whose terminal record is already stored. A terminal
+    /// record is final, so the run cannot be reopened or re-finished.
+    TerminalRun {
+        run_id: String,
     },
     /// A claim was lost to a concurrent winner (over-cap or already claimed).
     ClaimLost,
@@ -128,8 +200,23 @@ impl std::fmt::Display for StoreError {
                 f,
                 "sop store revision conflict for run {run_id}: divergent write at revision {revision}"
             ),
+            Self::TerminalRun { run_id } => write!(
+                f,
+                "sop store refused write for run {run_id}: the run is terminal and its record is final"
+            ),
             Self::ClaimLost => write!(f, "sop store claim lost to a concurrent winner"),
         }
+    }
+}
+
+impl StoreError {
+    /// The store holds newer state than the write was based on: another writer
+    /// moved the run on, or already finished it.
+    pub fn is_stale_write(&self) -> bool {
+        matches!(
+            self,
+            Self::StaleRevision { .. } | Self::RevisionConflict { .. } | Self::TerminalRun { .. }
+        )
     }
 }
 
@@ -147,6 +234,21 @@ impl From<serde_json::Error> for StoreError {
     }
 }
 
+/// Build the configured run store.
+///
+/// - `persist_runs = true` (default), backend `"sqlite"` (default) -> [`SqliteRunStore`] at
+///   `<run_state_dir | data_dir/sop>/runs.db` (dir created mode-0700), so in-flight runs -
+///   including runs parked at a HITL approval - survive a restart.
+/// - `persist_runs = false` -> ephemeral [`InMemoryRunStore`] (opt back into non-durable state).
+/// - `persist_runs = true`, backend `"memory"` -> ephemeral [`InMemoryRunStore`] (degraded/tests).
+///
+/// The backend is the closed `SopRunStoreBackend` enum, so an out-of-set value is
+/// rejected at config-deserialize time rather than here (no runtime unknown arm).
+///
+/// Called by `build_sop_engine`, which injects the result via `with_store` and
+/// then calls `restore_runs()` to rehydrate in-flight runs at startup. A
+/// backend-open failure is non-fatal there: the daemon logs and falls back to
+/// the in-memory store rather than failing to boot.
 pub fn build_run_store(
     cfg: &SopConfig,
     data_dir: &Path,
@@ -240,21 +342,104 @@ fn revision_guard(
     Ok(())
 }
 
+/// A terminal record is final: an active write never reopens it, and a
+/// terminal write is accepted only as a byte-identical retry.
+fn terminal_guard(
+    g: &Inner,
+    run_id: &str,
+    incoming: &PersistedRun,
+    finishing: bool,
+) -> Result<(), StoreError> {
+    if !g.terminal.contains(run_id) {
+        return Ok(());
+    }
+    if finishing
+        && let Some(existing) = g.runs.get(run_id)
+        && serde_json::to_vec(existing)? == serde_json::to_vec(incoming)?
+    {
+        return Ok(());
+    }
+    Err(StoreError::TerminalRun {
+        run_id: run_id.to_string(),
+    })
+}
+
+fn append_event_locked(g: &mut Inner, ev: &SopEventRecord) -> u64 {
+    g.seq += 1;
+    let seq = g.seq;
+    let mut rec = ev.clone();
+    rec.seq = seq;
+    g.events.entry(ev.run_id.clone()).or_default().push(rec);
+    seq
+}
+
 impl SopRunStore for InMemoryRunStore {
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
+        terminal_guard(&g, run.run_id(), run, false)?;
         revision_guard(g.runs.get(run.run_id()), run)?;
         g.runs.insert(run.run_id().to_string(), run.clone());
         Ok(())
     }
 
+    fn save_run_with_pending_capacity(
+        &self,
+        run: &PersistedRun,
+        max_pending: usize,
+    ) -> Result<bool, StoreError> {
+        let mut g = self.lock()?;
+        if max_pending > 0 {
+            let pending = g
+                .runs
+                .values()
+                .filter(|existing| !g.terminal.contains(existing.run_id()))
+                .filter(|existing| pending_capacity_member(existing, run))
+                .count();
+            if pending >= max_pending {
+                return Ok(false);
+            }
+        }
+        terminal_guard(&g, run.run_id(), run, false)?;
+        revision_guard(g.runs.get(run.run_id()), run)?;
+        g.runs.insert(run.run_id().to_string(), run.clone());
+        Ok(true)
+    }
+
+    fn save_run_with_event(
+        &self,
+        run: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        terminal_guard(&g, run.run_id(), run, false)?;
+        revision_guard(g.runs.get(run.run_id()), run)?;
+        g.runs.insert(run.run_id().to_string(), run.clone());
+        Ok(append_event_locked(&mut g, ev))
+    }
+
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
+        terminal_guard(&g, run_id, terminal, true)?;
         revision_guard(g.runs.get(run_id), terminal)?;
         g.runs.insert(run_id.to_string(), terminal.clone());
         g.terminal.insert(run_id.to_string());
         g.claims.remove(run_id);
         Ok(())
+    }
+
+    fn finish_run_with_event(
+        &self,
+        run_id: &str,
+        terminal: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        terminal_guard(&g, run_id, terminal, true)?;
+        revision_guard(g.runs.get(run_id), terminal)?;
+        g.runs.insert(run_id.to_string(), terminal.clone());
+        g.terminal.insert(run_id.to_string());
+        g.claims.remove(run_id);
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
@@ -357,6 +542,21 @@ impl SopRunStore for InMemoryRunStore {
         Ok(token)
     }
 
+    fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError> {
+        let mut g = self.lock()?;
+        if let Some(claim) = g.claims.get_mut(run_id) {
+            claim.holder = RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
+        }
+        Ok(())
+    }
+
+    fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
+        let g = self.lock()?;
+        Ok(g.claims
+            .get(run_id)
+            .is_some_and(|claim| claim.holder == RETAINED_TERMINAL_ROLLBACK_HOLDER))
+    }
+
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
         let g = self.lock()?;
         let per_sop = g.claims.values().filter(|c| c.sop_name == sop_name).count();
@@ -383,12 +583,7 @@ impl SopRunStore for InMemoryRunStore {
 
     fn append_event(&self, ev: &SopEventRecord) -> Result<u64, StoreError> {
         let mut g = self.lock()?;
-        g.seq += 1;
-        let seq = g.seq;
-        let mut rec = ev.clone();
-        rec.seq = seq;
-        g.events.entry(ev.run_id.clone()).or_default().push(rec);
-        Ok(seq)
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn list_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
@@ -503,6 +698,7 @@ mod tests {
         let sop_run = SopRun {
             run_id: id.to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -515,9 +711,14 @@ mod tests {
             total_steps: 1,
             started_at: started_at.clone(),
             completed_at: completed_at.map(|s| s.to_string()),
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         PersistedRun {
             version: SOP_STORE_VERSION,
@@ -526,6 +727,7 @@ mod tests {
             last_progress_at: started_at,
             redacted: false,
             trigger_source: SopTriggerSource::Manual,
+            writer: None,
         }
     }
 
@@ -674,6 +876,40 @@ mod tests {
         assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 6);
     }
 
+    /// Two writers that build the same state from the same revision write
+    /// records that differ only in their writer. The second is a competing
+    /// write, not a retry of the first, so it is refused; a retry from the
+    /// writer whose record is stored still matches.
+    #[test]
+    fn same_revision_write_from_another_writer_conflicts() {
+        let s = InMemoryRunStore::new();
+        let mut first = run("r1", 5, None);
+        first.writer = Some("engine-a".into());
+        let mut second = first.clone();
+        second.writer = Some("engine-b".into());
+        s.save_run(&first).unwrap();
+        assert!(matches!(
+            s.save_run(&second),
+            Err(StoreError::RevisionConflict { revision: 5, .. })
+        ));
+        s.save_run(&first).unwrap();
+
+        let mut terminal = run("r1", 6, Some("2020-01-02T00:00:00Z"));
+        terminal.writer = Some("engine-a".into());
+        let mut competing = terminal.clone();
+        competing.writer = Some("engine-b".into());
+        s.finish_run("r1", &terminal).unwrap();
+        assert!(matches!(
+            s.finish_run("r1", &competing),
+            Err(StoreError::TerminalRun { .. })
+        ));
+        s.finish_run("r1", &terminal).unwrap();
+        assert_eq!(
+            s.load_run("r1").unwrap().unwrap().writer.as_deref(),
+            Some("engine-a")
+        );
+    }
+
     #[test]
     fn finish_run_marks_terminal_and_releases_claim() {
         let s = InMemoryRunStore::new();
@@ -735,6 +971,53 @@ mod tests {
             .unwrap();
         assert!(s.load_active_runs().unwrap().is_empty());
         assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 6);
+    }
+
+    #[test]
+    fn terminal_run_is_final() {
+        let s = InMemoryRunStore::new();
+        s.save_run(&run("r1", 0, None)).unwrap();
+        let terminal = run("r1", 1, Some("2020-01-02T00:00:00Z"));
+        s.finish_run("r1", &terminal).unwrap();
+
+        // An active write at a newer revision must not reopen the run.
+        let err = s.save_run(&run("r1", 2, None)).unwrap_err();
+        assert!(err.to_string().contains("terminal"), "got {err}");
+        assert!(
+            s.save_run_with_event(&run("r1", 2, None), &ev("r1", "step_promoted"))
+                .is_err()
+        );
+        assert!(
+            s.save_run_with_pending_capacity(&run("r1", 2, None), 0)
+                .is_err()
+        );
+        // A second, different terminal write must not replace the first.
+        assert!(
+            s.finish_run("r1", &run("r1", 2, Some("2020-01-03T00:00:00Z")))
+                .is_err()
+        );
+        assert!(
+            s.finish_run_with_event(
+                "r1",
+                &run("r1", 2, Some("2020-01-03T00:00:00Z")),
+                &ev("r1", "run_cancelled")
+            )
+            .is_err()
+        );
+        // A byte-identical retry of the terminal write stays idempotent.
+        s.finish_run("r1", &terminal).unwrap();
+
+        let stored = s.load_run("r1").unwrap().unwrap();
+        assert_eq!(stored.revision, 1);
+        assert_eq!(
+            stored.run.completed_at.as_deref(),
+            Some("2020-01-02T00:00:00Z")
+        );
+        assert!(s.load_active_runs().unwrap().is_empty());
+        assert!(
+            s.list_events("r1").unwrap().is_empty(),
+            "a refused write appends no event"
+        );
     }
 
     #[test]
@@ -821,9 +1104,24 @@ mod tests {
     }
 
     #[test]
-    fn factory_defaults_to_in_memory() {
-        // persist_runs defaults false -> ephemeral, data_dir untouched.
-        let s = build_run_store(&cfg(), Path::new("/nonexistent")).unwrap();
+    fn factory_defaults_to_durable_sqlite() {
+        // persist_runs now defaults on (HITL admission durability) -> the durable
+        // sqlite backend is selected so a run parked at an approval survives restart.
+        let dir = std::env::temp_dir().join(format!("zc-sop-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = cfg();
+        c.run_state_dir = Some(dir.to_string_lossy().into_owned());
+        let s = build_run_store(&c, Path::new("/unused")).unwrap();
+        assert_eq!(s.backend(), "sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn factory_in_memory_when_persist_disabled() {
+        // Opt back out: persist_runs = false -> ephemeral in-memory, data_dir untouched.
+        let mut c = cfg();
+        c.persist_runs = false;
+        let s = build_run_store(&c, Path::new("/nonexistent")).unwrap();
         assert_eq!(s.backend(), "in-memory");
     }
 

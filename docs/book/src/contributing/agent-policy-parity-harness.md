@@ -27,10 +27,20 @@ runtime knobs) are assembled at several distinct sites:
 | Gateway | the gateway server |
 | `loop_::run` | non-interactive runs: cron jobs, the daemon heartbeat, sub-agent spawning |
 | Delegate | sub-agent delegation |
+| SOP live nested step | `drive_live_sop_actions`: a step delegating to a different agent re-assembles that agent's engine input in-flight |
 
 Each path must hand the engine the same policy for the same agent config. The
 parity harness asserts exactly that: a setting enforced on one path is enforced
-on every path.
+on every path. The SOP live nested-step path is a sub-turn inside an already-running
+turn: when a step names a different agent, its complete execution contract is
+re-assembled through the same seam rather than inherited from the parent turn --
+gated tools, security policy, MCP scope, provider binding and temperature, resolved
+runtime controls, and an approval manager carrying the step agent's risk profile
+under the parent surface's interactivity mode. The step runs on an explicit child
+transcript (its own system prompt plus the step context; the parent conversation
+never reaches the step agent's provider), and its records stamp the step agent as
+the acting identity with the delegating agent as parent correlation. A path that
+cannot re-assemble fails the cross-agent step closed.
 
 ## The parity matrix
 
@@ -60,14 +70,7 @@ into it and seal the inputs. With that resolution and sealing in place:
 - a newtype with a private field (for example a scoped tool registry that only the
   resolver can mint) makes handing the engine an unresolved policy a compile error.
 
-The end state is that the divergence is uncompilable rather than merely tested
-against. Current/future boundary: `ResolvedAgentExecution`, its `resolve()`
-constructor, and the `ResolvedIo` / `ResolvedRuntimeKnobs` input layers all exist on
-`master` and every production path constructs through them; the TOOL surface now has
-its gated constructor too (`ScopedToolRegistry::assemble`, below, with the gateway as
-its first consumer); absorbing the remaining surfaces' per-field resolution into
-`resolve()`, and sealing the bundle's fields behind it, are the work later surface
-PRs do.
+The end state is that the divergence is uncompilable rather than merely tested against. Current/future boundary: `ResolvedAgentExecution`, its `resolve()` constructor, and the `ResolvedIo` / `ResolvedRuntimeKnobs` input layers all exist on `master` and every production path constructs through them. The tool surface has its gated constructor and sealed registry type (`ScopedToolRegistry::assemble`, below). Absorbing the remaining surfaces' per-field resolution into `resolve()`, and sealing the bundle's other fields behind it, remain work for later surface PRs.
 
 ## The tool-assembly seam (Epic A, the first surface)
 
@@ -75,7 +78,7 @@ The per-agent tool registry is the first surface with a single gated constructor
 `ScopedToolRegistry::assemble` (`crates/zeroclaw-runtime/src/tools/scoped.rs`). The
 registry has historically been assembled by hand at six construction sites - the
 reason the built-in filter and MCP scoping had to be patched per-site (#7064,
-#6960, #8120). `assemble` applies, in order: the agent's `config.peripherals`
+\#6960, #8120). `assemble` applies, in order: the agent's `config.peripherals`
 (when connected - see the knob below), the built-in `allowed_tools`/
 `excluded_tools` filter, the ACP memory strip, MCP server scoping per `mcp_bundles`
 plus per-tool gating (eager or deferred; omission is not a grant) with the MCP
@@ -114,17 +117,11 @@ other path applied the plain `apply_policy_tool_filter`. #8701 retired that
 variant, so every path now applies the same plain filter (ledger A4, backed
 by an in-file positive parity test rather than a divergence characterization).
 
-The remaining hand-rolled sites - the channels orchestrator (`start_channels`),
-`Agent::from_config`, and the delegate independent-target builder
-(`independent_agentic_tools_for_target`, added by #8239 while this program was
-in flight - the recurrence the seal exists to end) - migrate in follow-up PRs.
-Once all sites mint through `assemble`, the engine's tools field
-seals to `ScopedToolRegistry` (a private-field newtype only `assemble` constructs),
-and handing the engine an unscoped registry - or quietly re-inlining a construction
-site, as a cross-merge did to the channel path once already - becomes a compile
-error instead of a review catch. Until that seal, cross-site parity for the
-not-yet-migrated sites remains by convention; what the seam guarantees today is
-that every path routed through it shares one implementation.
+The remaining construction sites have also migrated: the channels orchestrator (`start_channels`), `Agent::from_config`, and the delegate independent-target builder (`independent_agentic_tools_for_target`). The seal landed in #9319. Every production tool-assembly path now mints through `ScopedToolRegistry::assemble`. `ScopedToolRegistry` is a private-field newtype in `crates/zeroclaw-runtime/src/tools/scoped.rs`; the turn-engine carriers (`ResolvedAgentExecution` and `ResolvedIo`), `Agent`, and `ChannelRuntimeContext` carry that sealed type. Handing those carriers a raw tool vector instead is a compile error. The registry exposes immutable slice access; `retain` only narrows an already sealed registry, and `into_inner` consumes it for non-turn consumers such as listings.
+
+The fixture escape hatch remains: `ScopedToolRegistry::from_raw_for_test` is gated by `cfg(any(test, feature = "test-util"))`. The `test-util` feature supports cross-crate test fixtures and is enabled through development dependencies, not production dependency edges. The seal therefore enforces the production construction boundary without preventing tests from supplying raw fixtures.
+
+Parity row 1 is `Tested`. `parity_l2_builtin_filter_semantic_parity` in `crates/zeroclaw-runtime/src/agent/parity.rs` compares assembly with the shared built-in filter; `tools::scoped::tests::assemble_applies_the_builtin_filter_uniformly` verifies allowed and excluded tools at the assembly seam. These tests establish filter behavior. The private field and sealed carrier types establish the construction boundary; the tests do not independently execute every production entry path. `parity_matrix_rows_are_owned_tracked_and_evidenced` checks row bookkeeping only, not whether a named test exists or proves the claim. This closes the tool-construction divergence, not the remaining policy surfaces.
 
 ## The harness
 

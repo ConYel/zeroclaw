@@ -361,43 +361,30 @@ impl QQChannel {
         self
     }
 
-    /// Configure voice transcription for QQ audio attachments.
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
-        config: zeroclaw_config::schema::TranscriptionConfig,
+        _config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
         }
-
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(manager) => {
-                let sole_provider = {
-                    let providers = manager.available_providers();
-                    if providers.len() == 1 {
-                        Some(providers[0].to_string())
-                    } else {
-                        None
-                    }
-                };
-                let manager = if let Some(provider) = sole_provider {
-                    manager.with_agent_transcription_provider(provider)
-                } else {
-                    manager
-                };
-                self.transcription_manager = Some(Arc::new(manager));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "transcription manager init failed, QQ voice transcription disabled"
-                );
-            }
-        }
-
         self
     }
 
@@ -424,11 +411,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ token request failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "QQ token request").await?;
 
         let data: serde_json::Value = resp.json().await?;
         let token = data
@@ -540,11 +523,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ gateway request failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "QQ gateway request").await?;
 
         let data: serde_json::Value = resp.json().await?;
         let url = data
@@ -562,6 +541,74 @@ impl QQChannel {
             .to_string();
 
         Ok(url)
+    }
+
+    /// [`Channel::health_check`] against an explicit API base.
+    ///
+    /// Split out so a test can drive the whole check — the request shape it
+    /// issues and the verdict it reaches — against a stub server without
+    /// reaching the real API; production passes [`QQ_API_BASE`].
+    ///
+    /// The check has two steps because minting a token is not evidence the
+    /// credential works. `getAppAccessToken` succeeds for a bot the
+    /// platform has since disabled and for a token revoked before its
+    /// expiry, while every send and the gateway handshake then fail, so
+    /// the minted token is followed by `GET /users/@me` with the same
+    /// `QQBot <token>` header the send and listen paths use.
+    ///
+    /// A cached token is reused when one is live, rather than re-minting:
+    /// the probe is what establishes it still works, and re-minting would
+    /// spend the auth retry budget (four attempts with backoff) inside the
+    /// caller's own 10s timeout. QQ exposes no endpoint that validates a
+    /// *recipient*, so the check stops at the bot's identity by design —
+    /// an unusable peer ID surfaces only at send time.
+    async fn health_check_at(&self, api_base: &str) -> bool {
+        let token = match self.get_token().await {
+            Ok(token) => token,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "getAppAccessToken",
+                            "error": format!("{}", e),
+                        })),
+                    "qq: health check could not obtain an access token"
+                );
+                return false;
+            }
+        };
+
+        let probe = match self
+            .http_client()
+            .get(format!("{api_base}/users/@me"))
+            .header("Authorization", format!("QQBot {token}"))
+            .send()
+            .await
+        {
+            Err(e) => Err(anyhow::Error::from(e)),
+            Ok(resp) => crate::util::ensure_success(resp, "QQ health probe (/users/@me)")
+                .await
+                .map(|_| ()),
+        };
+
+        match probe {
+            Ok(()) => true,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "probeBotIdentity",
+                            "error": format!("{}", e),
+                        })),
+                    "qq: health check rejected by the API"
+                );
+                false
+            }
+        }
     }
 
     async fn record_dedup_key(&self, key: String) -> bool {
@@ -847,31 +894,72 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ upload media failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "QQ upload media").await?;
 
         let upload_resp: QQUploadResponse = resp.json().await?;
         Ok((upload_resp.file_info, upload_resp.ttl))
     }
 
-    /// Send a media message (msg_type=7) with an already-uploaded file_info.
-    async fn send_media_message(&self, recipient: &str, file_info: &str) -> anyhow::Result<()> {
-        let token = self.get_token().await?;
-        let (scope, id) = Self::resolve_recipient(recipient);
+    /// Build the request body for a markdown text message (msg_type=2).
+    ///
+    /// Pure function — no I/O, no token fetch, no HTTP. Extracted from
+    /// `send_text_markdown` so the body shape (including the optional
+    /// `msg_id` for passive group replies) can be asserted directly in
+    /// tests.
+    fn build_text_markdown_body(content: &str, in_reply_to: Option<&str>) -> serde_json::Value {
+        let mut body = json!({
+            "markdown": {
+                "content": content,
+            },
+            "msg_type": 2,
+            "msg_seq": next_msg_seq(),
+        });
 
-        let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
-        ensure_https(&url)?;
+        // Include msg_id for passive group replies to avoid active-message permission requirements
+        if let Some(msg_id) = in_reply_to {
+            body["msg_id"] = json!(msg_id);
+        }
 
-        let body = json!({
+        body
+    }
+
+    /// Build the request body for a media message (msg_type=7).
+    ///
+    /// Pure function — no I/O, no token fetch, no HTTP. Extracted from
+    /// `send_media_message` so the body shape (including the optional
+    /// `msg_id` for passive group replies) can be asserted directly in
+    /// tests.
+    fn build_media_message_body(file_info: &str, in_reply_to: Option<&str>) -> serde_json::Value {
+        let mut body = json!({
             "msg_type": 7,
             "media": {
                 "file_info": file_info,
             },
             "msg_seq": next_msg_seq(),
         });
+
+        // Include msg_id for passive group replies to avoid active-message permission requirements
+        if let Some(msg_id) = in_reply_to {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        body
+    }
+
+    /// Send a media message (msg_type=7) with an already-uploaded file_info.
+    async fn send_media_message(
+        &self,
+        recipient: &str,
+        file_info: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let token = self.get_token().await?;
+        let (scope, id) = Self::resolve_recipient(recipient);
+
+        let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
+        ensure_https(&url)?;
+
+        let body = Self::build_media_message_body(file_info, in_reply_to);
 
         let resp = self
             .http_client()
@@ -881,11 +969,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send media message failed ({status}): {err}");
-        }
+        crate::util::ensure_success(resp, "QQ send media message").await?;
 
         Ok(())
     }
@@ -895,6 +979,7 @@ impl QQChannel {
         &self,
         recipient: &str,
         attachment: &QQMediaAttachment,
+        in_reply_to: Option<&str>,
     ) -> anyhow::Result<()> {
         let target = attachment.target.trim();
 
@@ -915,7 +1000,8 @@ impl QQChannel {
                     file_name.as_deref(),
                 )
                 .await?;
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to)
+                .await?;
         } else {
             // Local file upload
             let path = Path::new(target);
@@ -949,7 +1035,7 @@ impl QQChannel {
                         .with_attrs(::serde_json::json!({"target": target})),
                     "using cached upload for"
                 );
-                self.send_media_message(recipient, &cached_file_info)
+                self.send_media_message(recipient, &cached_file_info, in_reply_to)
                     .await?;
                 return Ok(());
             }
@@ -971,7 +1057,8 @@ impl QQChannel {
                     .await;
             }
 
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to)
+                .await?;
         }
 
         Ok(())
@@ -1163,7 +1250,7 @@ impl QQChannel {
             anyhow::bail!("Download failed ({}): {url}", resp.status());
         }
 
-        let bytes = resp.bytes().await?.to_vec();
+        let bytes = crate::util::read_response_body_limited(resp, QQ_MAX_UPLOAD_BYTES).await?;
         tokio::fs::write(&dest, &bytes).await?;
 
         Ok((dest, bytes))
@@ -1209,20 +1296,19 @@ impl QQChannel {
     }
 
     /// Send a markdown text message (msg_type=2).
-    async fn send_text_markdown(&self, recipient: &str, content: &str) -> anyhow::Result<()> {
+    async fn send_text_markdown(
+        &self,
+        recipient: &str,
+        content: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
-            "markdown": {
-                "content": content,
-            },
-            "msg_type": 2,
-            "msg_seq": next_msg_seq(),
-        });
+        let body = Self::build_text_markdown_body(content, in_reply_to);
 
         let resp = self
             .http_client()
@@ -1232,11 +1318,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send message failed ({status}): {err}");
-        }
+        crate::util::ensure_success(resp, "QQ send message").await?;
 
         Ok(())
     }
@@ -1263,19 +1345,34 @@ impl Channel for QQChannel {
         if attachments.is_empty() {
             // No media markers — send as markdown (original path)
             return self
-                .send_text_markdown(&message.recipient, &message.content)
+                .send_text_markdown(
+                    &message.recipient,
+                    &message.content,
+                    message.in_reply_to.as_deref(),
+                )
                 .await;
         }
 
         // Send cleaned text first (if non-empty)
         if !cleaned_text.is_empty() {
-            self.send_text_markdown(&message.recipient, &cleaned_text)
-                .await?;
+            self.send_text_markdown(
+                &message.recipient,
+                &cleaned_text,
+                message.in_reply_to.as_deref(),
+            )
+            .await?;
         }
 
         // Send each media attachment
         for attachment in &attachments {
-            if let Err(e) = self.send_attachment(&message.recipient, attachment).await {
+            if let Err(e) = self
+                .send_attachment(
+                    &message.recipient,
+                    attachment,
+                    message.in_reply_to.as_deref(),
+                )
+                .await
+            {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
                 // Degrade to text fallback
                 let fallback = format!(
@@ -1288,8 +1385,12 @@ impl Channel for QQChannel {
                     },
                     attachment.target
                 );
-                self.send_text_markdown(&message.recipient, &fallback)
-                    .await?;
+                self.send_text_markdown(
+                    &message.recipient,
+                    &fallback,
+                    message.in_reply_to.as_deref(),
+                )
+                .await?;
             }
         }
 
@@ -1594,7 +1695,7 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                id: msg_id.to_string(),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -1667,7 +1768,7 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                id: msg_id.to_string(),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -1761,8 +1862,11 @@ impl Channel for QQChannel {
         }
     }
 
+    /// Probe the configured credentials against the live API. See
+    /// `health_check_at` for what the probe establishes and what it
+    /// deliberately cannot.
     async fn health_check(&self) -> bool {
-        self.fetch_access_token_with_retry().await.is_ok()
+        self.health_check_at(QQ_API_BASE).await
     }
 
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
@@ -2157,6 +2261,73 @@ allowed_users = ["user1"]
         assert_eq!(body["media"]["file_info"], file_info);
     }
 
+    // --- Regression coverage: triggering msg_id propagation ---
+    //
+    // The tests above (`test_send_media_body_msg_type_7`,
+    // `test_send_body_uses_markdown_msg_type`) construct lookalike JSON
+    // bodies inline and would still pass if `build_media_message_body`
+    // or `build_text_markdown_body` dropped or corrupted the `msg_id`
+    // field. The tests below exercise the actual helpers that
+    // `send_media_message` and `send_text_markdown` use to build the
+    // outgoing request body, so removing the msg_id propagation would
+    // break them.
+
+    #[test]
+    fn regression_text_markdown_body_includes_msg_id_for_reply() {
+        let body = QQChannel::build_text_markdown_body("hello", Some("trigger_msg_42"));
+
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hello");
+        assert_eq!(
+            body["msg_id"], "trigger_msg_42",
+            "passive group replies must echo the triggering msg_id \
+             (tracker #7872 / PR #9180) so QQ treats the message as a \
+             passive reply rather than an active send"
+        );
+    }
+
+    #[test]
+    fn regression_text_markdown_body_omits_msg_id_when_no_reply() {
+        let body = QQChannel::build_text_markdown_body("hello", None);
+
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hello");
+        assert!(
+            body.get("msg_id").is_none(),
+            "proactive (non-reply) sends must not carry an msg_id \
+             field — a stray msg_id would cause QQ to try to attach \
+             the message to a stale thread"
+        );
+    }
+
+    #[test]
+    fn regression_media_message_body_includes_msg_id_for_reply() {
+        let body = QQChannel::build_media_message_body("cached_file_info", Some("trigger_msg_99"));
+
+        assert_eq!(body["msg_type"], 7);
+        assert_eq!(body["media"]["file_info"], "cached_file_info");
+        assert_eq!(
+            body["msg_id"], "trigger_msg_99",
+            "passive group media replies must echo the triggering \
+             msg_id (tracker #7872 / PR #9180) — same contract as the \
+             text path, since send_attachment threads in_reply_to \
+             through to send_media_message"
+        );
+    }
+
+    #[test]
+    fn regression_media_message_body_omits_msg_id_when_no_reply() {
+        let body = QQChannel::build_media_message_body("cached_file_info", None);
+
+        assert_eq!(body["msg_type"], 7);
+        assert_eq!(body["media"]["file_info"], "cached_file_info");
+        assert!(
+            body.get("msg_id").is_none(),
+            "proactive (non-reply) media sends must not carry an msg_id \
+             field — same contract as the text path"
+        );
+    }
+
     // --- compose_message_content tests (now async) ---
 
     fn local_whisper_transcription_config(
@@ -2327,6 +2498,51 @@ allowed_users = ["user1"]
         assert!(result.contains("[VOICE:"));
         assert!(result.contains("qq_files/download_"));
         assert!(result.contains(".wav]"));
+    }
+
+    #[tokio::test]
+    async fn oversized_attachment_keeps_remote_marker_without_writing_file() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            QQ_MAX_UPLOAD_BYTES + 1
+        )
+        .into_bytes();
+        let (server_url, server) = crate::util::spawn_raw_http_response(response, true).await;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let remote_url = format!("{server_url}/oversized.png");
+        let payload = json!({
+            "attachments": [{
+                "content_type": "image/png",
+                "filename": "oversized.png",
+                "url": remote_url
+            }]
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            composed_content(&ch, &payload),
+        )
+        .await
+        .expect("declared oversize must be rejected before reading the body")
+        .unwrap();
+        server.abort();
+
+        assert!(
+            result.contains(&format!("[IMAGE:{remote_url}]")),
+            "unexpected composed content: {result:?}"
+        );
+        let mut files = tokio::fs::read_dir(workspace.path().join("qq_files"))
+            .await
+            .unwrap();
+        assert!(files.next_entry().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2621,6 +2837,79 @@ allowed_users = ["user1"]
         assert!(
             result.is_err(),
             "should fail when token expired and no server available"
+        );
+    }
+
+    // --- Health probe tests ---
+    //
+    // Every case seeds the token cache with a live-expiry token so the
+    // check exercises the probe rather than the auth endpoint: no network
+    // beyond the stub, and a failure can only come from the probe itself.
+
+    #[tokio::test]
+    async fn health_check_accepts_a_live_token() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/@me"))
+            // The API accepts the credential only in this exact scheme; a
+            // mismatch would 401 in production and report the channel down.
+            .and(header("Authorization", "QQBot tok_abc"))
+            // The probe reads only the verdict, so this body is a shape
+            // placeholder, not a captured response.
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "zeroclaw_bot",
+                "username": "ZEROCLAW",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+        *ch.token_cache.write().await = Some(("tok_abc".to_string(), now_secs() + 3600));
+
+        assert!(
+            ch.health_check_at(&mock_server.uri()).await,
+            "an accepted identity response must report the channel healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_a_rejected_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/@me"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "message": "invalid or expired access token",
+                "code": 11244,
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+        // Minting succeeded, so the app secret is fine; only the token is
+        // rejected. That is the case the auth-only check used to report
+        // healthy.
+        *ch.token_cache.write().await = Some(("revoked".to_string(), now_secs() + 3600));
+
+        assert!(
+            !ch.health_check_at(&mock_server.uri()).await,
+            "a rejected token must report the channel unhealthy"
         );
     }
 

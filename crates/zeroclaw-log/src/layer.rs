@@ -28,6 +28,11 @@ const F_ACTION: &str = "zc_action";
 const F_OUTCOME: &str = "zc_outcome";
 const F_CATEGORY: &str = "zc_category";
 const F_ATTRS: &str = "zc_attrs";
+/// `record!` transport field carrying broadcast-only ephemeral attributes
+/// (QR payloads, pair codes). Shared with the terminal formatter so it can
+/// redact this field from verbose stderr output. See
+/// `subscriber::RedactEphemeralFields`.
+pub(crate) const F_EPHEMERAL_ATTRS: &str = "zc_ephemeral_attrs";
 const F_HAS_DURATION: &str = "zc_has_duration";
 const F_DURATION_MS: &str = "zc_duration_ms";
 const F_FILE: &str = "zc_file";
@@ -157,6 +162,12 @@ where
         {
             log_event.attributes = v;
         }
+        if let Some(ephemeral_json) = visitor.ephemeral_attrs_json
+            && !ephemeral_json.is_empty()
+            && let Ok(v) = serde_json::from_str::<Value>(&ephemeral_json)
+        {
+            log_event.ephemeral_attributes = v;
+        }
         if !visitor.extra.is_empty() {
             if log_event.attributes.is_null() {
                 log_event.attributes = Value::Object(visitor.extra);
@@ -169,34 +180,30 @@ where
 
         // Attach source location for jump-to-source from log viewers.
         if visitor.file.is_some() || visitor.line.is_some() {
-            let map = match &mut log_event.attributes {
-                Value::Object(m) => m,
-                _ => {
-                    log_event.attributes = Value::Object(JsonMap::new());
-                    match &mut log_event.attributes {
-                        Value::Object(m) => m,
-                        _ => unreachable!(),
-                    }
-                }
-            };
-            if let Some(f) = visitor.file {
-                map.entry("_file".to_string()).or_insert(Value::String(f));
+            if !log_event.attributes.is_object() {
+                log_event.attributes = Value::Object(JsonMap::new());
             }
-            if let Some(l) = visitor.line {
-                map.entry("_line".to_string()).or_insert(Value::from(l));
+            if let Some(map) = log_event.attributes.as_object_mut() {
+                if let Some(f) = visitor.file {
+                    map.entry("_file".to_string()).or_insert(Value::String(f));
+                }
+                if let Some(l) = visitor.line {
+                    map.entry("_line".to_string()).or_insert(Value::from(l));
+                }
             }
         }
 
         // Walk span scope leaf→root, merging every attribution snapshot
         // and every ScopeExtra stash along the way. Inner spans win
-        // because we merge_from() / entry().or_insert() which fills only
-        // absent keys.
+        // because explicit composite groups stay with their nearest source;
+        // type-only groups can inherit a matching outer instance. Plain fields
+        // and extra attributes fill only absent keys.
         if let Some(span_ref) = ctx.lookup_current() {
             let mut current = Some(span_ref);
             while let Some(span) = current {
                 let exts = span.extensions();
                 if let Some(parent) = exts.get::<ZeroclawAttribution>() {
-                    log_event.zeroclaw.merge_from(parent);
+                    log_event.zeroclaw.merge_scope_from(parent);
                 }
                 if let Some(scope_extra) = exts.get::<ScopeExtra>() {
                     if log_event.attributes.is_null() {
@@ -234,6 +241,7 @@ struct EventCollector {
     outcome: Option<String>,
     category: Option<String>,
     attrs_json: Option<String>,
+    ephemeral_attrs_json: Option<String>,
     has_duration: Option<bool>,
     duration_ms: Option<u64>,
     file: Option<String>,
@@ -330,6 +338,11 @@ impl EventCollector {
             F_ATTRS => {
                 if let Value::String(s) = value {
                     self.attrs_json = Some(s);
+                }
+            }
+            F_EPHEMERAL_ATTRS => {
+                if let Value::String(s) = value {
+                    self.ephemeral_attrs_json = Some(s);
                 }
             }
             F_DURATION_MS => {
@@ -682,6 +695,135 @@ mod e2e_tests {
         crate::clear_broadcast_hook();
     }
 
+    #[test]
+    fn nested_composite_scope_keeps_serialized_attribution_coherent() {
+        use tracing_subscriber::prelude::*;
+
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+        let mut rx = subscribe_or_install();
+        let subscriber = tracing_subscriber::registry().with(super::LogCaptureLayer);
+        let thing = FakeTelegramChannel {
+            alias: "outer".into(),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    use zeroclaw_log::Instrument;
+                    async {
+                        zeroclaw_log::scope!(
+                            model_provider: "anthropic.outer",
+                            agent_alias: "outer-agent",
+                            => async {
+                                zeroclaw_log::scope!(
+                                    channel: "webhook",
+                                    model_provider: "ollama",
+                                    => async {
+                                        zeroclaw_log::record!(
+                                            INFO,
+                                            Event::new(module_path!(), Action::Note),
+                                            "nested composite bare"
+                                        );
+                                    }
+                                ).await;
+                                zeroclaw_log::scope!(channel: "matrix.inner", => async {
+                                    zeroclaw_log::record!(
+                                        INFO,
+                                        Event::new(module_path!(), Action::Note),
+                                        "nested composite dotted"
+                                    );
+                                }).await;
+                                zeroclaw_log::scope!(
+                                    channel: "telegram",
+                                    model_provider: "anthropic",
+                                    => async {
+                                        zeroclaw_log::record!(
+                                            INFO,
+                                            Event::new(module_path!(), Action::Note),
+                                            "nested composite matching type"
+                                        );
+                                    }
+                                ).await;
+                                let span = zeroclaw_log::info_span!(
+                                    target: "zeroclaw_log_internal_scope",
+                                    "late_composite",
+                                    channel = "webhook",
+                                );
+                                span.record("channel", "webhook.updated");
+                                let _entered = span.enter();
+                                zeroclaw_log::record!(
+                                    INFO,
+                                    Event::new(module_path!(), Action::Note),
+                                    "nested composite same span update"
+                                );
+                            }
+                        )
+                        .await;
+                    }
+                    .instrument(zeroclaw_log::attribution_span!(&thing))
+                    .await;
+                });
+        });
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| {
+                event["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("nested composite "))
+            })
+            .collect();
+        assert_eq!(events.len(), 4, "{events:?}");
+        let bare = &events[0];
+        assert_eq!(bare["message"], "nested composite bare");
+        let attribution = &bare["zeroclaw"];
+        for (prefix, expected_type) in [("channel", "webhook"), ("model_provider", "ollama")] {
+            assert_eq!(attribution[crate::event::type_field(prefix)], expected_type);
+            assert!(attribution.get(prefix).is_none(), "{attribution}");
+            assert!(
+                attribution.get(crate::event::alias_field(prefix)).is_none(),
+                "{attribution}"
+            );
+        }
+        assert_eq!(attribution["agent_alias"], "outer-agent");
+
+        let dotted = &events[1];
+        assert_eq!(dotted["message"], "nested composite dotted");
+        assert_eq!(dotted["zeroclaw"]["channel"], "matrix.inner");
+        assert_eq!(dotted["zeroclaw"]["channel_type"], "matrix");
+        assert_eq!(dotted["zeroclaw"]["channel_alias"], "inner");
+        assert_eq!(dotted["zeroclaw"]["model_provider"], "anthropic.outer");
+        assert_eq!(dotted["zeroclaw"]["model_provider_alias"], "outer");
+
+        let matching = &events[2];
+        assert_eq!(matching["message"], "nested composite matching type");
+        for (prefix, expected_type) in [("channel", "telegram"), ("model_provider", "anthropic")] {
+            assert_eq!(
+                matching["zeroclaw"][prefix],
+                format!("{expected_type}.outer")
+            );
+            assert_eq!(
+                matching["zeroclaw"][crate::event::type_field(prefix)],
+                expected_type
+            );
+            assert_eq!(
+                matching["zeroclaw"][crate::event::alias_field(prefix)],
+                "outer"
+            );
+        }
+
+        let updated = &events[3];
+        assert_eq!(updated["message"], "nested composite same span update");
+        assert_eq!(updated["zeroclaw"]["channel"], "webhook.updated");
+        assert_eq!(updated["zeroclaw"]["channel_type"], "webhook");
+        assert_eq!(updated["zeroclaw"]["channel_alias"], "updated");
+        crate::clear_broadcast_hook();
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn system_role_span_populates_system_alias() {
@@ -746,6 +888,120 @@ mod e2e_tests {
         crate::clear_broadcast_hook();
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn scope_promotes_sop_run_id_to_attribution() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let run_id = "run-scope-test-0001";
+        zeroclaw_log::scope!(
+            sop_run_id: run_id,
+            => async {
+                zeroclaw_log::record!(
+                    INFO,
+                    Event::new(module_path!(), Action::Invoke),
+                    "sop-run scope e2e test"
+                );
+            }
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = false;
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value.get("message").and_then(|v| v.as_str())
+                        == Some("sop-run scope e2e test") =>
+                {
+                    assert_eq!(
+                        value
+                            .pointer("/zeroclaw/sop_run_id")
+                            .and_then(|v| v.as_str()),
+                        Some(run_id),
+                        "scope field must be promoted into canonical attribution: {value:?}",
+                    );
+                    assert!(value.pointer("/attributes/sop_run_id").is_none());
+                    found = true;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) | Ok(Ok(_)) => {}
+            }
+        }
+        assert!(found, "did not receive the scoped SOP run event");
+        crate::clear_broadcast_hook();
+    }
+
+    /// Ephemeral attrs attached at the call site must reach the broadcast
+    /// copy (deep-merged into `attributes`) through the full `record!` →
+    /// layer → writer pipeline. The at-rest exclusion is covered by
+    /// `writer::tests::ephemeral_attributes_reach_broadcast_but_never_disk`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn with_ephemeral_attrs_reaches_broadcast_merged() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        zeroclaw_log::record!(
+            INFO,
+            Event::new(module_path!(), Action::Note)
+                .with_attrs(::serde_json::json!({"login": {"state": "qr"}}))
+                .with_ephemeral_attrs(
+                    ::serde_json::json!({"login": {"qr_payload": "EPHEMERAL-QR"}})
+                ),
+            "ephemeral-attrs e2e test"
+        );
+
+        let mut found = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("ephemeral-attrs e2e test"))
+                        .unwrap_or(false)
+                    {
+                        let login = &value["attributes"]["login"];
+                        assert_eq!(
+                            login.get("qr_payload").and_then(|v| v.as_str()),
+                            Some("EPHEMERAL-QR"),
+                            "broadcast copy must carry ephemeral attrs, got: {value:?}"
+                        );
+                        assert_eq!(login.get("state").and_then(|v| v.as_str()), Some("qr"));
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(found, "did not find the ephemeral-attrs test event");
+
+        crate::clear_broadcast_hook();
+    }
+
+    /// A `trace_id` carried in the call site's `with_attrs` payload must be
+    /// promoted by the layer into the native top-level `trace_id` field (so
+    /// `?trace_id=` filters match), while ALSO remaining inside `attributes`
+    /// for the observer bridge.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn with_attrs_trace_id_promoted_to_native_field() {

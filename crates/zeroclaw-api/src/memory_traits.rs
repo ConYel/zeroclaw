@@ -13,6 +13,57 @@ pub struct ExportFilter {
     pub until: Option<String>,
 }
 
+/// The composite scope of one principal's private memory (RFC 7141).
+///
+/// The owner is one dimension composed WITH, never instead of, the agent,
+/// namespace and tenant dimensions the shared plane already has: two agents
+/// hold two rows under the same visible key for the same principal, and a
+/// principal permitted only a non-default agent stores and reads under that
+/// agent. `None` for a dimension means the backend's default for it (the
+/// default agent, the default namespace, no tenant), not "any".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalScope {
+    /// The durable owner identity (the canonical principal id).
+    pub principal_id: String,
+    /// The agent alias the rows belong to; `None` = the default agent.
+    pub agent_alias: Option<String>,
+    /// The namespace; `None` = the default namespace.
+    pub namespace: Option<String>,
+    /// The tenant; `None` = no tenant.
+    pub tenant_id: Option<String>,
+}
+
+impl PrincipalScope {
+    /// A scope on the default agent and namespace with no tenant.
+    #[must_use]
+    pub fn new(principal_id: impl Into<String>) -> Self {
+        Self {
+            principal_id: principal_id.into(),
+            agent_alias: None,
+            namespace: None,
+            tenant_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_agent(mut self, agent_alias: Option<String>) -> Self {
+        self.agent_alias = agent_alias;
+        self
+    }
+
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: Option<String>) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tenant(mut self, tenant_id: Option<String>) -> Self {
+        self.tenant_id = tenant_id;
+        self
+    }
+}
+
 /// A single memory entry
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -41,6 +92,14 @@ pub struct MemoryEntry {
     /// Tenant or end-user scope for multi-user memory isolation.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Owning principal for PRIVATE principal memory (RFC 7141). `None`
+    /// marks the shared/legacy plane: rows visible to unscoped
+    /// connections and agent-loop recall. A private row is visible only
+    /// through the principal-scoped operations, and the owner is an
+    /// additional dimension composed WITH (never replacing) the agent,
+    /// session, namespace, and tenant dimensions.
+    #[serde(default)]
+    pub principal_id: Option<String>,
     /// Resolved, human-readable agent alias for this row (the HashMap key
     /// in `Config::agents`, e.g. `"clamps"`). SQL-backed stores produce
     /// this via `LEFT JOIN agents ON agents.id = memories.agent_id`;
@@ -216,6 +275,10 @@ impl StoreOptions {
         self.tenant_id = Some(tenant_id.into());
         self
     }
+
+    pub fn requires_full_options_storage(&self) -> bool {
+        self.kind.is_some() || self.pinned || self.tenant_id.is_some()
+    }
 }
 
 /// Read-side memory store telemetry.
@@ -309,6 +372,110 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// that can hold more than one row per `key` — the unscoped `forget`
     /// would destroy sibling rows.
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool>;
+
+    // ── Private principal memory (RFC 7141) ─────────────────────────
+    //
+    // One principal's private plane: every operation carries the owner in
+    // the storage statement itself (atomic predicate), composed WITH the
+    // agent, session, namespace and tenant dimensions of the scope, and the
+    // legacy operations above never see private rows. The defaults FAIL
+    // CLOSED: a backend that has not implemented principal scoping refuses
+    // private-memory operations rather than silently un-scoping them.
+
+    /// Store into the scope's private memory. The owner and every other
+    /// scope dimension are written in the same statement that stores the row.
+    async fn store_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _key: &str,
+        _content: &str,
+        _category: MemoryCategory,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Recall within the scope's private memory only.
+    async fn recall_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// List within the scope's private memory only. The category predicate
+    /// is applied in storage, before any result limit.
+    async fn list_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _category: Option<&MemoryCategory>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Get one row from the scope's private memory; other principals' rows
+    /// and shared-plane rows are invisible. Storage errors are errors, never
+    /// `None`.
+    async fn get_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Remove one row from the scope's private memory: the ownership
+    /// predicate and the delete are one statement.
+    async fn forget_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _key: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Count the rows in the scope's private memory.
+    async fn count_for_principal(&self, _scope: &PrincipalScope) -> anyhow::Result<usize> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Export the scope's private rows, owner preserved and keys as the
+    /// caller sees them. Ordinary [`Memory::export`] never returns private
+    /// rows; this is the explicit, owner-preserving path.
+    async fn export_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Bulk-delete the scope's private rows in `namespace`. The owner
+    /// travels in the DELETE predicate; foreign and shared rows are never
+    /// touched.
+    async fn purge_namespace_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _namespace: &str,
+    ) -> anyhow::Result<usize> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Bulk-delete the scope's private rows for `session_id`, with the owner
+    /// in the DELETE predicate.
+    async fn purge_session_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _session_id: &str,
+    ) -> anyhow::Result<usize> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
 
     /// Remove all memories whose `namespace` field equals the given value.
     /// Returns the number of deleted entries.
@@ -476,15 +643,31 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self
-            .recall(query, limit * 2, session_id, since, until)
-            .await?;
-        let filtered: Vec<MemoryEntry> = entries
-            .into_iter()
-            .filter(|e| e.namespace == namespace)
-            .take(limit)
-            .collect();
-        Ok(filtered)
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .recall(query, fetch_limit, session_id, since, until)
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered: Vec<MemoryEntry> = entries
+                .into_iter()
+                .filter(|e| e.namespace == namespace)
+                .take(limit)
+                .collect();
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered);
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered);
+            }
+            fetch_limit = next_fetch_limit;
+        }
     }
 
     /// Bulk-export memories matching the given filter criteria.
@@ -541,8 +724,10 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 
     /// Store a memory entry with the full additive metadata surface.
     ///
-    /// Default delegates through the existing metadata method and intentionally
-    /// ignores fields that older backends do not yet persist.
+    /// Default delegates through the existing metadata method for namespace and
+    /// importance only. Backends that do not override this must fail explicitly
+    /// when callers pass typed/full metadata, rather than silently discarding
+    /// data needed by later typed-memory readers.
     async fn store_with_options(
         &self,
         key: &str,
@@ -551,6 +736,12 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         session_id: Option<&str>,
         options: StoreOptions,
     ) -> anyhow::Result<()> {
+        if options.requires_full_options_storage() {
+            anyhow::bail!(
+                "memory backend '{}' does not support StoreOptions kind/pinned/tenant_id; use a backend that overrides store_with_options",
+                self.name()
+            );
+        }
         self.store_with_metadata(
             key,
             content,
@@ -558,6 +749,40 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
             session_id,
             options.namespace.as_deref(),
             options.importance,
+        )
+        .await
+    }
+
+    /// Store a memory entry with full metadata and an explicit agent UUID.
+    ///
+    /// The compatibility default preserves agent attribution through the
+    /// established `store_with_agent` path for namespace and importance only.
+    /// Backends that persist the full `StoreOptions` surface override this
+    /// method so wrappers do not have to choose between attribution and typed
+    /// metadata.
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if options.requires_full_options_storage() {
+            anyhow::bail!(
+                "memory backend '{}' does not support agent-attributed StoreOptions kind/pinned/tenant_id; use a backend that overrides store_with_options_and_agent",
+                self.name()
+            );
+        }
+        self.store_with_agent(
+            key,
+            content,
+            category,
+            session_id,
+            options.namespace.as_deref(),
+            options.importance,
+            agent_id,
         )
         .await
     }
@@ -681,6 +906,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_optional_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "id-1".into(),
             key: "favorite_language".into(),
             content: "Rust".into(),
@@ -737,6 +963,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_new_memory_plane_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "id-2".into(),
             key: "deployment_decision".into(),
             content: "Use staged rollout".into(),
@@ -763,5 +990,143 @@ mod tests {
         );
         assert!(parsed.pinned);
         assert_eq!(parsed.tenant_id.as_deref(), Some("tenant-1"));
+    }
+
+    struct LegacyOptionsMemory;
+
+    impl crate::attribution::Attributable for LegacyOptionsMemory {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Memory(crate::attribution::MemoryKind::InMemory)
+        }
+
+        fn alias(&self) -> &str {
+            "legacy-options"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for LegacyOptionsMemory {
+        fn name(&self) -> &str {
+            "legacy-options"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn compatibility_defaults_reject_full_store_options() {
+        let memory = LegacyOptionsMemory;
+        memory
+            .store_with_options(
+                "metadata-only",
+                "metadata only",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default()
+                    .with_namespace("ops")
+                    .with_importance(0.7),
+            )
+            .await
+            .expect("namespace/importance compatibility path remains supported");
+
+        let err = memory
+            .store_with_options(
+                "typed",
+                "typed",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default().with_kind(MemoryKind::Semantic(SemanticSubtype::Decision)),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not support StoreOptions"));
+
+        let err = memory
+            .store_with_options_and_agent(
+                "typed-agent",
+                "typed agent",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default().with_kind(MemoryKind::Semantic(SemanticSubtype::Decision)),
+                Some("agent-uuid"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support agent-attributed StoreOptions")
+        );
     }
 }

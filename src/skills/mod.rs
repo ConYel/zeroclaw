@@ -50,9 +50,9 @@ pub mod skill_http {
     #[allow(unused_imports)]
     pub use zeroclaw_runtime::skills::skill_http::*;
 }
+mod discovery;
 
 // The lib target sees this as dead; only the bin target calls it from main.rs.
-#[allow(dead_code)]
 pub async fn handle_command(
     command: crate::SkillCommands,
     config: &crate::config::Config,
@@ -234,6 +234,8 @@ pub async fn handle_command(
             agent,
             bundle,
             no_tier_banner,
+            skill,
+            well_known,
         } => {
             println!(
                 "{}",
@@ -247,10 +249,53 @@ pub async fn handle_command(
             let skills_path = location.dir().to_path_buf();
             std::fs::create_dir_all(&skills_path)?;
 
-            let (installed_dir, files_scanned) = if is_clawhub_source(&source) {
-                install_clawhub_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                    .await
-                    .with_context(|| format!("failed to install skill from ClawHub: {source}"))?
+            let (installed_dir, files_scanned) = if well_known {
+                let skill_name = skill.as_deref().ok_or_else(|| {
+                    anyhow::Error::msg(get_required_cli_string(
+                        "cli-skills-install-well-known-requires-skill",
+                    ))
+                })?;
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-resolving-well-known",
+                        &[("source", &source), ("skill", skill_name)],
+                    )
+                );
+                discovery::install_well_known_skill(
+                    &source,
+                    skill_name,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    &config.security.nat64_prefixes,
+                )
+                .await
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-well-known-failed",
+                        &[("skill", skill_name), ("source", &source)],
+                    )
+                })?
+            } else if let Some(skill_name) = skill.as_deref() {
+                if !is_git_source(&source) {
+                    anyhow::bail!(get_required_cli_string_with_args(
+                        "cli-skills-install-skill-requires-git",
+                        &[("source", &source)]
+                    ));
+                }
+                install_git_catalog_skill_source(
+                    &source,
+                    skill_name,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    workspace_dir,
+                )
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-catalog-failed",
+                        &[("skill", skill_name), ("source", &source)],
+                    )
+                })?
             } else if is_git_source(&source) {
                 install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| {
@@ -751,6 +796,8 @@ fn handle_add(
         tags: Vec::new(),
         // Slash options are authored in the dashboard editor, not at scaffold time.
         slash_options: Vec::new(),
+        // Scaffolded skills load on demand; always-inject is opt-in via the editor.
+        always: false,
     };
 
     let skill_dir = service.scaffold_skill(
@@ -1439,6 +1486,8 @@ mod install_location_tests {
                 agent: None,
                 bundle: None,
                 no_tier_banner: true,
+                skill: None,
+                well_known: false,
             },
             &c,
         )

@@ -1,11 +1,20 @@
 //! Hand-maintained mirrors for every type that crosses the JSON-RPC
 //! wire between `zerocode` and the ZeroClaw daemon.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// ── Initialize shapes ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandDescriptor {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
 
 // ── Doctor result shapes ────────────────────────────────────────
 
@@ -38,6 +47,11 @@ pub struct DoctorSummary {
 pub struct DoctorRunResult {
     pub results: Vec<DoctorResultEntry>,
     pub summary: DoctorSummary,
+    /// Resolved active log persistence path from the daemon, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_phase: Option<String>,
 }
 
 #[cfg(test)]
@@ -79,7 +93,34 @@ pub struct ModelProviderChoice {
 pub struct ChannelQuickStart {
     pub channel_type: String,
     pub alias: String,
-    pub token: Option<String>,
+    /// Schema-keyed fields from `quickstart/fields`. ZeroCode's initialize
+    /// handshake rejects daemon package-version mismatches before this wire
+    /// shape can be submitted.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fields: HashMap<String, String>,
+}
+
+#[cfg(test)]
+mod quickstart_wire_tests {
+    use super::*;
+
+    #[test]
+    fn channel_quickstart_wire_shape_matches_runtime_contract() {
+        let channel = ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "ops".into(),
+            fields: HashMap::from([("bot_token".into(), "123:ABC".into())]),
+        };
+
+        assert_eq!(
+            serde_json::to_value(channel).expect("serialize channel"),
+            serde_json::json!({
+                "channel_type": "telegram",
+                "alias": "ops",
+                "fields": { "bot_token": "123:ABC" }
+            })
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,121 +179,12 @@ pub enum MemoryBackendKind {
     Lucid,
 }
 
-// ── Quickstart state / step / surface ──────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub struct QuickstartState {
-    pub quickstart_completed: bool,
-    pub agents: Vec<String>,
-    pub risk_profiles: Vec<String>,
-    pub runtime_profiles: Vec<String>,
-    #[serde(default)]
-    pub default_runtime_profile: Option<String>,
-    pub model_providers: Vec<String>,
-    pub channels: Vec<String>,
-    #[serde(default)]
-    pub unassigned_channels: Vec<String>,
-    pub storage: Vec<String>,
-    #[serde(default)]
-    pub model_provider_types: Vec<QuickstartTypeOption>,
-    #[serde(default)]
-    pub channel_types: Vec<QuickstartTypeOption>,
-    #[serde(default)]
-    pub risk_presets: Vec<QuickstartPresetMirror>,
-    #[serde(default)]
-    pub runtime_presets: Vec<QuickstartPresetMirror>,
-    #[serde(default)]
-    pub memory_kinds: Vec<String>,
-    #[serde(default)]
-    pub personality_files: Vec<String>,
-}
-
-/// Wire view of `zeroclaw_config::presets::RiskPreset` / `RuntimePreset`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct QuickstartPresetMirror {
-    pub preset_name: String,
-    pub label: String,
-    pub help: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct QuickstartTypeOption {
-    pub kind: String,
-    pub display_name: String,
-    #[serde(default)]
-    pub local: bool,
-    #[serde(default)]
-    pub default_runtime_profile: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Surface {
-    Web,
-    Tui,
-    Cli,
-    Test,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QuickstartStep {
-    ModelProvider,
-    RiskProfile,
-    RuntimeProfile,
-    Memory,
-    Channels,
-    PeerGroups,
-    Agent,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct QuickstartError {
-    pub step: QuickstartStep,
-    pub field: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct AppliedAgent {
-    pub alias: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldSection {
-    ModelProvider,
-    Channel,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct FieldDescriptor {
-    pub key: String,
-    pub label: String,
-    #[serde(default)]
-    pub help: String,
-    pub kind: PropKind,
-    #[serde(default)]
-    pub is_secret: bool,
-    #[serde(default)]
-    pub enum_variants: Option<Vec<String>>,
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default)]
-    pub default: Option<String>,
-}
-
 // ── Config explorer wire shapes ────────────────────────────────
 
 /// Schema field-kind tag mirroring `zeroclaw_config::traits::PropKind`.
-/// Carries the canonical eight variants — adding one in the schema
-/// must mirror here too; `wire_drift::prop_kind_variants_round_trip`
-/// fails when they diverge.
+/// zerocode does not depend on `zeroclaw-config`, so adding a variant in
+/// the schema must be mirrored here by hand: an unknown tag fails to
+/// deserialize the whole `config/list` response.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PropKind {
@@ -265,6 +197,9 @@ pub enum PropKind {
     StringArray,
     ObjectArray,
     Object,
+    /// Container row for a secret key/value map (MCP `env`, `headers`, …).
+    /// Entries are the sibling `<path>.<KEY>` rows.
+    SecretMap,
 }
 
 impl PropKind {
@@ -282,6 +217,7 @@ impl PropKind {
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
+            Self::SecretMap => "secret_map",
         }
     }
 }
@@ -371,6 +307,13 @@ impl std::fmt::Display for ConfigTab {
     }
 }
 
+/// Setup facts supplied by the canonical config owner. Absence of this
+/// metadata means requirements are unknown, not that a field is optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigFieldSetup {
+    pub missing: bool,
+}
+
 /// Single config-property descriptor returned by `config/list` and
 /// `config/sections`. Mirrors `zeroclaw_config::traits::ConfigFieldEntry`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,6 +337,8 @@ pub struct ConfigFieldEntry {
     pub tab: ConfigTab,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_source: Option<AliasSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<ConfigFieldSetup>,
 }
 
 /// Section-page shape returned by `config/sections`. Mirrors
@@ -426,75 +371,18 @@ pub struct FsEntry {
     pub mtime: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsListDirRequest {
-    pub path: String,
-    #[serde(default)]
-    pub show_hidden: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsStatResult {
-    pub name: String,
-    pub full_path: String,
-    pub is_dir: bool,
-    pub is_hidden: bool,
-    pub size: u64,
-    pub mtime: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsStatError {
-    pub path: String,
-    pub code: String,
-    pub message: String,
-}
-
 // ── Misc passthrough shapes ────────────────────────────────────
-
-/// Opaque value envelope. Some RPC responses (logs subscription,
-/// raw JSON-RPC notifications) carry arbitrary payloads — the TUI
-/// just forwards them.
-pub type RawValue = Value;
-
-/// Mode discriminator for an outbound `elicitation/create` request.
-/// Phase 1 of the rollout only emits `Form`; `Url` is on the wire
-/// for future use.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ElicitationMode {
-    Form,
-    Url,
-}
 
 /// Params for an inbound `elicitation/create` request from the
 /// daemon. The TUI receives this, surfaces the form to the user,
-/// and ships back an `ElicitationResponseAction` envelope.
+/// and responds through the JSON-RPC transport.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ElicitationRequestParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    pub mode: ElicitationMode,
     pub message: String,
     #[serde(rename = "requestedSchema")]
     pub requested_schema: Value,
-}
-
-/// Action discriminant the TUI returns. The daemon decodes
-/// `Accept { content }` into the original choice text via
-/// `zeroclaw_api::elicitation::decode_*` helpers.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "action", rename_all = "lowercase")]
-pub enum ElicitationResponseAction {
-    Accept {
-        /// For single-select: `{"choice": "choice-<idx>"}`.
-        /// For multi-select: `{"choices": ["choice-<a>", "choice-<b>", …]}`.
-        content: Value,
-    },
-    Decline,
-    Cancel,
 }
 
 /// A single option as parsed from the `oneOf` / `anyOf` schema. The
@@ -502,7 +390,6 @@ pub enum ElicitationResponseAction {
 /// `title` field carries the human-readable label.
 #[derive(Debug, Clone)]
 pub struct ElicitationChoice {
-    pub const_id: String,
     pub title: String,
 }
 
@@ -513,11 +400,9 @@ pub struct ElicitationChoice {
 #[derive(Debug, Clone)]
 pub enum ElicitationShape {
     Single {
-        property: String,
         choices: Vec<ElicitationChoice>,
     },
     Multi {
-        property: String,
         choices: Vec<ElicitationChoice>,
         min_items: usize,
         max_items: usize,
@@ -531,8 +416,7 @@ impl ElicitationShape {
     /// shape we don't yet render — the TUI auto-cancels in that case.
     pub fn from_schema(schema: &Value) -> Option<Self> {
         let properties = schema.get("properties")?.as_object()?;
-        let (property, prop_schema) = properties.iter().next()?;
-        let property = property.clone();
+        let prop_schema = properties.values().next()?;
 
         // Multi-select: `type: array` with `items.anyOf`.
         if prop_schema.get("type").and_then(Value::as_str) == Some("array") {
@@ -548,7 +432,6 @@ impl ElicitationShape {
                 .and_then(Value::as_u64)
                 .unwrap_or(choices.len() as u64) as usize;
             return Some(Self::Multi {
-                property,
                 choices,
                 min_items,
                 max_items,
@@ -562,24 +445,10 @@ impl ElicitationShape {
             if choices.is_empty() {
                 return None;
             }
-            return Some(Self::Single { property, choices });
+            return Some(Self::Single { choices });
         }
 
         None
-    }
-
-    /// The schema's first property name — used when building the
-    /// `accept` content envelope to satisfy the issued schema.
-    pub fn property(&self) -> &str {
-        match self {
-            Self::Single { property, .. } | Self::Multi { property, .. } => property,
-        }
-    }
-
-    pub fn choices(&self) -> &[ElicitationChoice] {
-        match self {
-            Self::Single { choices, .. } | Self::Multi { choices, .. } => choices,
-        }
     }
 }
 
@@ -593,7 +462,7 @@ fn parse_choice_options(items: &[Value]) -> Vec<ElicitationChoice> {
                 .and_then(Value::as_str)
                 .unwrap_or(&const_id)
                 .to_string();
-            Some(ElicitationChoice { const_id, title })
+            Some(ElicitationChoice { title })
         })
         .collect()
 }
@@ -601,28 +470,6 @@ fn parse_choice_options(items: &[Value]) -> Vec<ElicitationChoice> {
 #[cfg(test)]
 mod elicitation_wire_tests {
     use super::*;
-
-    #[test]
-    fn elicitation_response_accept_serializes_with_lowercase_action() {
-        let resp = ElicitationResponseAction::Accept {
-            content: serde_json::json!({ "choice": "choice-1" }),
-        };
-        let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["action"], "accept");
-        assert_eq!(v["content"]["choice"], "choice-1");
-    }
-
-    #[test]
-    fn elicitation_response_decline_serializes() {
-        let v = serde_json::to_value(ElicitationResponseAction::Decline).unwrap();
-        assert_eq!(v["action"], "decline");
-    }
-
-    #[test]
-    fn elicitation_response_cancel_serializes() {
-        let v = serde_json::to_value(ElicitationResponseAction::Cancel).unwrap();
-        assert_eq!(v["action"], "cancel");
-    }
 
     #[test]
     fn request_params_round_trips_canonical_shape() {
@@ -646,7 +493,6 @@ mod elicitation_wire_tests {
         });
         let params: ElicitationRequestParams = serde_json::from_value(raw).unwrap();
         assert_eq!(params.session_id, "sess-1");
-        assert_eq!(params.mode, ElicitationMode::Form);
         assert_eq!(params.message, "Pick one");
     }
 
@@ -666,10 +512,8 @@ mod elicitation_wire_tests {
         });
         let shape = ElicitationShape::from_schema(&schema).expect("single");
         match shape {
-            ElicitationShape::Single { property, choices } => {
-                assert_eq!(property, "choice");
+            ElicitationShape::Single { choices } => {
                 assert_eq!(choices.len(), 2);
-                assert_eq!(choices[0].const_id, "choice-0");
                 assert_eq!(choices[0].title, "Apple");
                 assert_eq!(choices[1].title, "Banana");
             }
@@ -699,12 +543,10 @@ mod elicitation_wire_tests {
         let shape = ElicitationShape::from_schema(&schema).expect("multi");
         match shape {
             ElicitationShape::Multi {
-                property,
                 choices,
                 min_items,
                 max_items,
             } => {
-                assert_eq!(property, "choices");
                 assert_eq!(choices.len(), 3);
                 assert_eq!(min_items, 1);
                 assert_eq!(max_items, 2);
@@ -798,4 +640,69 @@ mod plan_wire_tests {
         let back: PlanEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back, entry);
     }
+}
+
+// Config publication receipts and the daemon's bounded application ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishedConfigRevision {
+    pub epoch: String,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigStatusResult {
+    #[serde(default)]
+    pub application: Option<ConfigApplicationStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigApplicationStatus {
+    pub published_revision: PublishedConfigRevision,
+    pub records: Vec<ConfigApplicationRecord>,
+    pub record_limit: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigApplicationRecord {
+    pub path: Vec<String>,
+    pub target: ConfigApplicationTarget,
+    pub revision: PublishedConfigRevision,
+    pub outcome: ConfigApplicationOutcome,
+    #[serde(default)]
+    pub reason: Option<ConfigApplicationReason>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigApplicationTarget {
+    Daemon,
+    Session {
+        id: String,
+        generation: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApplicationOutcome {
+    Pending,
+    AppliedLive,
+    QueuedForReload,
+    Rejected,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApplicationReason {
+    AwaitingAcknowledgement,
+    DaemonReloadRequired,
+    ChangeScopeUnavailable,
+    TargetRetired,
+    #[serde(other)]
+    Unknown,
 }

@@ -757,7 +757,10 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -1040,6 +1043,7 @@ mod tests {
         SopRun {
             run_id: "r1".into(),
             sop_name: "g".into(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -1052,14 +1056,20 @@ mod tests {
             total_steps: 3,
             started_at: "2026-01-01T00:00:00Z".into(),
             completed_at: None,
+            failure_reason: None,
             step_results: results,
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         }
     }
 
     fn result(step: u32, status: SopStepStatus) -> SopStepResult {
         SopStepResult {
+            effective_agent: None,
             step_number: step,
             status,
             output: String::new(),

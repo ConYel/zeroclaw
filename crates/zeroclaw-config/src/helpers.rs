@@ -62,6 +62,26 @@ pub fn route_double_hashmap_path<'a>(
     Some((outer_key, inner_key, inner_name))
 }
 
+/// True when `e` is exactly the "Unknown property" marker produced by the
+/// `Configurable` derive's `set_prop`/`get_prop` fallback (and by
+/// `prop_name_to_serde_field` in this module) for the specific property
+/// `name` the caller just tried. Namespace-sharing nested delegation sites
+/// (serde-flatten, `Option<T>`, dotted-key candidate loops) use it to tell
+/// "not one of mine — keep trying siblings" apart from a real value error
+/// on a confirmed path.
+///
+/// Both constructors build the error as exactly `Unknown property
+/// '{name}'` via `anyhow::Error::msg(String)`, so the downcast is the
+/// typed identity check and still works through `anyhow` context layers.
+/// Display text alone is not sufficient: a different error type can render
+/// the same message but must not be mistaken for this fall-through marker and
+/// silently swallowed as a retry.
+pub fn is_unknown_property_error(e: &anyhow::Error, name: &str) -> bool {
+    let expected = format!("Unknown property '{name}'");
+    e.downcast_ref::<String>()
+        .is_some_and(|msg| *msg == expected)
+}
+
 pub fn route_vec_path<'a, 'k, I>(
     name: &'a str,
     my_prefix: &str,
@@ -245,9 +265,11 @@ pub fn make_prop_field(
         description,
         derived_from_secret,
         credential_class,
+        application: crate::traits::ApplicationCapability::default(),
         tab,
         alias_source,
         multiline,
+        setup: None,
     }
 }
 
@@ -288,7 +310,12 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
     {
         table.remove(&serde_name);
     } else {
-        table.insert(serde_name, parse_prop_value(value_str, kind)?);
+        let parsed = if kind == PropKind::ObjectArray && name.ends_with("read_memory_from") {
+            parse_memory_grant_array(value_str)?
+        } else {
+            parse_prop_value(value_str, kind)?
+        };
+        table.insert(serde_name, parsed);
     }
     *target = toml::from_str(&toml::to_string(&table)?)?;
     Ok(())
@@ -548,7 +575,42 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
                 anyhow::Error::msg("JSON object contained only nulls, nothing to write")
             })
         }
+        // Secret-map container rows are intercepted by the Configurable
+        // derive (entries are set per `<path>.<KEY>`); reaching the generic
+        // parser means a caller bypassed that routing.
+        PropKind::SecretMap => {
+            reject(
+                "secret_map",
+                ::serde_json::json!({"kind": "secret_map", "reason": "container-not-settable"}),
+            );
+            anyhow::bail!("key/value map fields are set per entry as `<path>.<KEY>`")
+        }
     }
+}
+
+/// Preserve the legacy `config set` and environment-override grammar for the
+/// untagged `MemoryGrant` array while still accepting its structured JSON form.
+fn parse_memory_grant_array(value_str: &str) -> anyhow::Result<toml::Value> {
+    let trimmed = value_str.trim();
+    if trimmed.is_empty() || trimmed == crate::traits::UNSET_DISPLAY {
+        return Ok(toml::Value::Array(Vec::new()));
+    }
+
+    if trimmed.starts_with('[') {
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::Error::msg(format!("invalid JSON memory grant array: {e}")))?;
+        return json_to_toml(value)
+            .ok_or_else(|| anyhow::Error::msg("JSON memory grant array contained only nulls"));
+    }
+
+    Ok(toml::Value::Array(
+        trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty() && *item != crate::traits::UNSET_DISPLAY)
+            .map(|item| toml::Value::String(item.to_string()))
+            .collect(),
+    ))
 }
 
 /// Walk a `serde_json::Value` into a `toml::Value`, dropping any `null`s
@@ -594,8 +656,14 @@ pub fn validate_alias_key(key: &str) -> Result<(), String> {
             key.len()
         ));
     }
-    let first = key.chars().next().unwrap();
-    let last = key.chars().next_back().unwrap();
+    let first = key
+        .chars()
+        .next()
+        .ok_or_else(|| "alias must not be empty".to_string())?;
+    let last = key
+        .chars()
+        .next_back()
+        .ok_or_else(|| "alias must not be empty".to_string())?;
     if !matches!(first, 'a'..='z' | '0'..='9') {
         return Err(format!(
             "alias '{key}' must start with a lowercase letter or digit"
@@ -909,6 +977,22 @@ mod tests {
         assert_eq!(arr[1].as_str(), Some(r#"p@ss"word"#));
     }
 
+    #[test]
+    fn parse_memory_grant_array_accepts_legacy_and_structured_forms() {
+        let legacy = parse_memory_grant_array("beta, gamma").unwrap();
+        assert_eq!(legacy.as_array().unwrap().len(), 2);
+        assert_eq!(legacy.as_array().unwrap()[0].as_str(), Some("beta"));
+
+        let mixed =
+            parse_memory_grant_array(r#"["beta", {"agent":"gamma", "categories":["facts"]}]"#)
+                .unwrap();
+        assert_eq!(mixed.as_array().unwrap().len(), 2);
+        assert_eq!(
+            mixed.as_array().unwrap()[1]["agent"],
+            toml::Value::String("gamma".into())
+        );
+    }
+
     // ── validate_alias_key ────────────────────────────────────────────────
 
     #[test]
@@ -1069,5 +1153,57 @@ mod tests {
         assert_eq!(kebab_to_snake("uri"), "uri");
         assert_eq!(kebab_to_snake("model"), "model");
         assert_eq!(kebab_to_snake(""), "");
+    }
+
+    // ── is_unknown_property_error ───────────────────────────────────────
+
+    #[test]
+    fn is_unknown_property_error_matches_the_exact_generated_sentinel() {
+        // Same construction the two real fallbacks use.
+        let marker = anyhow::Error::msg(format!("Unknown property '{}'", "gateway.port"));
+        assert!(is_unknown_property_error(&marker, "gateway.port"));
+    }
+
+    #[test]
+    fn is_unknown_property_error_matches_a_context_wrapped_typed_sentinel() {
+        let marker = anyhow::Error::msg(format!("Unknown property '{}'", "gateway.port"))
+            .context("while routing a nested property");
+        assert!(is_unknown_property_error(&marker, "gateway.port"));
+    }
+
+    #[test]
+    fn is_unknown_property_error_rejects_an_exact_text_non_string_error() {
+        let lookalike =
+            anyhow::Error::new(std::io::Error::other("Unknown property 'gateway.port'"));
+        assert_eq!(lookalike.to_string(), "Unknown property 'gateway.port'");
+        assert!(!is_unknown_property_error(&lookalike, "gateway.port"));
+    }
+
+    #[test]
+    fn is_unknown_property_error_rejects_a_value_error_that_merely_shares_the_prefix() {
+        // A genuine value error (e.g. a future or custom nested
+        // validator/deserializer failure) can happen to start with the same
+        // "Unknown property" text as the generated fall-through marker
+        // without being that marker. Built the same way the real
+        // constructors build their errors (`anyhow::Error::msg(String)`),
+        // so this exercises the exact downcast path the classifier prefers.
+        let value_error = anyhow::Error::msg(
+            "Unknown property value rejected by a custom field validator".to_string(),
+        );
+        assert!(
+            !is_unknown_property_error(&value_error, "gateway.port"),
+            "a value error sharing the marker's prefix must not be classified as \
+             'not mine' just because it starts with the same text — doing so would \
+             have it silently retried/masked instead of propagated"
+        );
+    }
+
+    #[test]
+    fn is_unknown_property_error_rejects_sentinel_for_a_different_name() {
+        // The sentinel for one property must not be mistaken for the
+        // sentinel of another — exact-name matching, not just exact-text
+        // matching against some fixed literal.
+        let marker = anyhow::Error::msg(format!("Unknown property '{}'", "gateway.port"));
+        assert!(!is_unknown_property_error(&marker, "gateway.host"));
     }
 }

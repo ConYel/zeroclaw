@@ -616,7 +616,13 @@ fn bedrock_model_supports_native_thinking(model: &str) -> bool {
 
 fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    model.contains("claude") || model.contains("nova")
+    if model.contains("claude") {
+        return true;
+    }
+    // The Nova 2 generation rejects `cachePoint` with a 400 despite matching the
+    // Nova family. Caching is an optimization, so unconfirmed generations skip
+    // it rather than risk the error; Nova 1 (Micro/Lite/Pro/Premier) keeps it.
+    model.contains("nova") && !model.contains("nova-2")
 }
 
 #[derive(Debug, Serialize)]
@@ -654,9 +660,6 @@ struct ConverseResponse {
     #[serde(default)]
     output: Option<ConverseOutput>,
     #[serde(default)]
-    #[allow(dead_code)]
-    stop_reason: Option<String>,
-    #[serde(default)]
     usage: Option<BedrockUsage>,
 }
 
@@ -677,8 +680,6 @@ struct ConverseOutput {
 
 #[derive(Debug, Deserialize)]
 struct ConverseOutputMessage {
-    #[allow(dead_code)]
-    role: String,
     content: Vec<ResponseContentBlock>,
 }
 
@@ -688,7 +689,7 @@ enum ResponseContentBlock {
     ToolUse(ResponseToolUseWrapper),
     ReasoningContent(ReasoningContentWrapper),
     Text(TextBlock),
-    Other(#[allow(dead_code)] serde_json::Value),
+    Other(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -731,60 +732,118 @@ pub struct BedrockModelProvider {
     cred_cache: Mutex<Option<AwsCredentials>>,
 }
 
-impl BedrockModelProvider {
-    pub fn new(alias: &str) -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
-        if let Some(token) = env_optional("BEDROCK_API_KEY") {
-            return Self {
-                alias: alias.to_string(),
-                auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-                cred_cache: Mutex::new(None),
-            };
-        }
-        Self {
-            alias: alias.to_string(),
-            auth: AwsCredentials::from_env()
-                .or_else(|_| AwsCredentials::from_credential_process())
-                .ok()
-                .map(BedrockAuth::SigV4),
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
+/// Typed builder for [`BedrockModelProvider`].
+///
+/// `alias` is the only positional argument. Whether the built provider
+/// probes ambient AWS credentials (`BEDROCK_API_KEY` env, then
+/// `AwsCredentials::from_env`, then `AwsCredentials::from_credential_process`)
+/// depends on whether [`Self::bearer_token`] was called: setting an
+/// explicit token bypasses every probe, and specifically avoids
+/// spawning the `credential_process` command from `~/.aws/config`.
+/// Leaving it unset lets `build()` walk the standard AWS resolution
+/// chain — the shape long-standing callers rely on when they wire
+/// Bedrock through the AWS environment.
+#[must_use]
+pub struct BedrockBuilder {
+    alias: String,
+    bearer_token: Option<String>,
+    max_tokens: Option<u32>,
+}
 
-    pub async fn new_async(alias: &str) -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
-        if let Some(token) = env_optional("BEDROCK_API_KEY") {
-            return Self {
-                alias: alias.to_string(),
-                auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-                cred_cache: Mutex::new(None),
-            };
-        }
-        let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
-        Self {
-            alias: alias.to_string(),
-            auth,
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
-
-    /// Create a model_provider using a Bearer token for authentication.
-    pub fn with_bearer_token(alias: &str, token: &str) -> Self {
-        Self {
-            alias: alias.to_string(),
-            auth: Some(BedrockAuth::BearerToken(token.to_string())),
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
-    /// Override the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
+impl BedrockBuilder {
+    /// Set an explicit Bearer token. When set, [`Self::build`] uses it
+    /// directly and skips every AWS credential probe (including the
+    /// `credential_process` command that would otherwise spawn a shell).
+    pub fn bearer_token(mut self, token: &str) -> Self {
+        self.bearer_token = Some(token.to_string());
         self
+    }
+
+    /// Override the maximum output tokens for API requests. Defaults to
+    /// [`zeroclaw_api::model_provider::BASELINE_MAX_TOKENS`] when unset.
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Finalize the provider synchronously.
+    ///
+    /// If `bearer_token` was set, uses it as-is with no ambient probe.
+    /// Otherwise walks the standard chain (`BEDROCK_API_KEY` env →
+    /// `AwsCredentials::from_env` → `AwsCredentials::from_credential_process`),
+    /// which can spawn the `credential_process` command from
+    /// `~/.aws/config`. Use [`Self::build_async`] if you need the
+    /// IMDS-aware resolver (which requires an async context).
+    pub fn build(self) -> BedrockModelProvider {
+        let auth = if let Some(token) = self.bearer_token {
+            Some(BedrockAuth::BearerToken(token))
+        } else {
+            resolve_ambient_auth_blocking()
+        };
+        BedrockModelProvider {
+            alias: self.alias,
+            auth,
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            cred_cache: Mutex::new(None),
+        }
+    }
+
+    /// Finalize the provider through the async credential resolver
+    /// (which additionally probes EC2 IMDSv2). Same bearer-token
+    /// short-circuit as [`Self::build`].
+    pub async fn build_async(self) -> BedrockModelProvider {
+        let auth = if let Some(token) = self.bearer_token {
+            Some(BedrockAuth::BearerToken(token))
+        } else {
+            resolve_ambient_auth_async().await
+        };
+        BedrockModelProvider {
+            alias: self.alias,
+            auth,
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            cred_cache: Mutex::new(None),
+        }
+    }
+}
+
+/// Walk the standard ambient AWS credential chain synchronously:
+/// `BEDROCK_API_KEY` env → `AwsCredentials::from_env` →
+/// `AwsCredentials::from_credential_process`. The last step can spawn
+/// the `credential_process` command from `~/.aws/config`.
+fn resolve_ambient_auth_blocking() -> Option<BedrockAuth> {
+    if let Some(token) = env_optional("BEDROCK_API_KEY") {
+        return Some(BedrockAuth::BearerToken(token));
+    }
+    AwsCredentials::from_env()
+        .or_else(|_| AwsCredentials::from_credential_process())
+        .ok()
+        .map(BedrockAuth::SigV4)
+}
+
+/// Async counterpart of [`resolve_ambient_auth_blocking`] that also
+/// probes EC2 IMDSv2 via [`AwsCredentials::resolve`].
+async fn resolve_ambient_auth_async() -> Option<BedrockAuth> {
+    if let Some(token) = env_optional("BEDROCK_API_KEY") {
+        return Some(BedrockAuth::BearerToken(token));
+    }
+    AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4)
+}
+
+impl BedrockModelProvider {
+    /// Entry point. Only `alias` is required; use
+    /// [`BedrockBuilder::bearer_token`] to pin an explicit token
+    /// (skipping every ambient probe) or call [`BedrockBuilder::build`]
+    /// with no token to walk the AWS credential chain.
+    pub fn builder(alias: &str) -> BedrockBuilder {
+        BedrockBuilder {
+            alias: alias.to_string(),
+            bearer_token: None,
+            max_tokens: None,
+        }
     }
 
     fn http_client(&self) -> Client {
@@ -974,7 +1033,23 @@ impl BedrockModelProvider {
                     converse_messages.push(tool_result_msg);
                 }
                 _ => {
-                    let content_blocks = Self::parse_user_content_blocks(&msg.content);
+                    // A prompt-mode tool-result carrier reads through its
+                    // declaration, never its body: the declared image
+                    // attachments become image blocks and the carrier text
+                    // survives verbatim as one text block, through the same
+                    // `parse_user_message_image_refs` seam every other
+                    // adapter uses. Ordinary user messages keep the marker
+                    // behavior unchanged.
+                    let content_blocks = if zeroclaw_api::tool_carrier::classify(
+                        &msg.role,
+                        &msg.content,
+                    )
+                    .is_some()
+                    {
+                        Self::parse_prompt_carrier_content_blocks(&msg.content)
+                    } else {
+                        Self::parse_user_content_blocks(&msg.content)
+                    };
                     converse_messages.push(ConverseMessage {
                         role: "user".to_string(),
                         content: content_blocks,
@@ -1124,12 +1199,7 @@ impl BedrockModelProvider {
                     let mime = &rest[..semi];
                     let after_semi = &rest[semi + 1..];
                     if let Some(b64) = after_semi.strip_prefix("base64,") {
-                        let format = match mime {
-                            "image/png" => "png",
-                            "image/gif" => "gif",
-                            "image/webp" => "webp",
-                            _ => "jpeg",
-                        };
+                        let format = Self::image_format_for_mime(mime);
                         blocks.push(ContentBlock::Image(ImageWrapper {
                             image: ImageBlock {
                                 format: format.to_string(),
@@ -1171,6 +1241,94 @@ impl BedrockModelProvider {
         }
 
         blocks
+    }
+
+    /// Build user-role blocks for a prompt-mode tool-result carrier: the
+    /// declared image attachments become image blocks, and the carrier text
+    /// `parse_user_message_image_refs` returns (the rebuilt carrier without
+    /// its image attachment lines) becomes one verbatim text block that is
+    /// never scanned for markers. The Bedrock counterpart of the seam every
+    /// other adapter routes user-role carriers through, so a carrier body
+    /// quoting marker syntax stays text instead of smuggling an image into
+    /// the request.
+    fn parse_prompt_carrier_content_blocks(content: &str) -> Vec<ContentBlock> {
+        let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
+        let mut blocks = Vec::new();
+
+        for image_ref in &image_refs {
+            let (mime, payload) = if image_ref.starts_with("data:") {
+                // Routed through the same shared structural check the
+                // anthropic adapter's user arm uses, so both adapters agree
+                // on what a deliverable image is: a header without `;base64`,
+                // a media type off the allowlist, a non-canonical payload, or
+                // one over the per-image ceiling is dropped here instead of
+                // drawing a 400 from the API.
+                match crate::multimodal::split_base64_image_data_uri(
+                    image_ref,
+                    crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES,
+                ) {
+                    Ok((mime, payload)) => (mime.to_ascii_lowercase(), payload.to_string()),
+                    Err(reason) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{reason}"),
+                                "error_key": "bedrock_image_marker_malformed_data_uri",
+                            })),
+                            "dropping image marker: data URI failed the structural check"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "bedrock_image_source_missing",
+                        })),
+                    "dropping image marker: source is neither a data URI nor an existing file"
+                );
+                // The multimodal normalizer is the only component allowed to
+                // turn a file reference into inline image content, so a
+                // non-inline reference is dropped rather than read: reading
+                // the path (extension-inferred MIME, no size or content
+                // validation) would reopen the hole the normalizer exists to
+                // close. Mirrors the anthropic adapter's user arm.
+                continue;
+            };
+
+            let format = Self::image_format_for_mime(&mime);
+            blocks.push(ContentBlock::Image(ImageWrapper {
+                image: ImageBlock {
+                    format: format.to_string(),
+                    source: ImageSource {
+                        bytes: payload.to_string(),
+                    },
+                },
+            }));
+        }
+
+        blocks.push(ContentBlock::Text(TextBlock { text }));
+        blocks
+    }
+
+    /// Map an image MIME media type to the Bedrock image `format` field
+    /// value. JPEG is the catch-all, exactly as the inline user-marker parse
+    /// has always mapped it.
+    fn image_format_for_mime(mime: &str) -> &'static str {
+        match mime {
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "jpeg",
+        }
     }
 
     /// Parse assistant message containing structured tool calls.
@@ -1304,6 +1462,7 @@ impl BedrockModelProvider {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
 
         if let Some(output) = response.output
@@ -1337,7 +1496,7 @@ impl BedrockModelProvider {
                             });
                         }
                     }
-                    ResponseContentBlock::Other(_) => {}
+                    ResponseContentBlock::Other(value) => drop(value),
                 }
             }
         }
@@ -1839,7 +1998,7 @@ mod tests {
     #[test]
     fn creates_without_credentials() {
         // ModelProvider should construct even without env vars.
-        let _provider = BedrockModelProvider::new("test");
+        let _provider = BedrockModelProvider::builder("test").build();
     }
 
     #[tokio::test]
@@ -1874,10 +2033,58 @@ mod tests {
 
     #[test]
     fn creates_with_bearer_token() {
-        let model_provider = BedrockModelProvider::with_bearer_token("test", "test-api-key");
+        let model_provider = BedrockModelProvider::builder("test")
+            .bearer_token("test-api-key")
+            .build();
         assert!(model_provider.auth.is_some());
         assert!(
             matches!(model_provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
+        );
+    }
+
+    /// Regression for the factory-side explicit-API-key path.
+    ///
+    /// The pre-refactor code used `BedrockModelProvider::with_bearer_token(alias, api_key)`,
+    /// which directly constructed a bearer-token provider and skipped
+    /// every ambient AWS credential probe. An earlier iteration of this
+    /// refactor routed the same path through `new(alias).with_bearer_token(...)`,
+    /// which meant `new(alias)` would still walk `BEDROCK_API_KEY` env → SigV4
+    /// env → `credential_process` (spawning a shell command from
+    /// `~/.aws/config`) before the bearer-token override took effect —
+    /// an observable security-boundary regression.
+    ///
+    /// This test proves the current builder-based explicit-key path
+    /// bypasses every ambient probe: with the AWS config file pointed at
+    /// `/dev/null` (so any `credential_process` walk would either err out
+    /// or, if the parser were ever changed, spawn `/dev/null` as a
+    /// command) and with `BEDROCK_API_KEY` deliberately set to a
+    /// distractor value, the resulting `auth` must be exactly the
+    /// caller-supplied bearer token.
+    #[test]
+    fn bearer_token_builder_skips_ambient_credential_probe() {
+        let _env_lock = env_lock();
+        // A stale ambient bearer would beat the explicit one if the
+        // builder probed env before applying the caller's token.
+        let _bedrock_env = EnvGuard::set("BEDROCK_API_KEY", Some("distractor-ambient-token"));
+        // Point the AWS config file at /dev/null so any accidental
+        // credential_process walk fails loudly instead of silently
+        // reading from the developer's real ~/.aws/config.
+        let _aws_config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
+        // Also clear the SigV4 env vars so from_env cannot silently
+        // succeed and mask an unintended probe.
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
+
+        let model_provider = BedrockModelProvider::builder("test")
+            .bearer_token("explicit-caller-token")
+            .build();
+
+        assert!(
+            matches!(
+                model_provider.auth,
+                Some(BedrockAuth::BearerToken(ref t)) if t == "explicit-caller-token"
+            ),
+            "explicit bearer_token() must skip BEDROCK_API_KEY probe and win over any ambient value"
         );
     }
 
@@ -1889,7 +2096,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
 
-        let model_provider = BedrockModelProvider::new("test");
+        let model_provider = BedrockModelProvider::builder("test").build();
         assert!(matches!(
             model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "env-bearer-token"
@@ -1903,7 +2110,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
 
-        let model_provider = BedrockModelProvider::new("test");
+        let model_provider = BedrockModelProvider::builder("test").build();
         // Bearer token should take priority over SigV4 credentials.
         assert!(matches!(
             model_provider.auth,
@@ -1975,6 +2182,128 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    fn image_marker(target: &str) -> String {
+        zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
+            target: target.to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        })
+    }
+
+    /// A count-zero carrier whose body quotes a data-URI marker and a path
+    /// marker, the ordinary shape of a tool reading source text that
+    /// contains them. The carrier reads through its declaration, so the
+    /// quotes stay body text: zero image blocks, and the delivered text is
+    /// the carrier byte-for-byte, no marker rewrite.
+    #[test]
+    fn convert_messages_prompt_carrier_quoting_data_uri_marker_stays_text() {
+        let body = format!(
+            "source example: {} and {} in prose",
+            image_marker("data:image/png;base64,QUJD"),
+            image_marker("/tmp/quoted.png")
+        );
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let messages = vec![ChatMessage::user(carrier.clone())];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert!(
+            !msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image(_))),
+            "no image block may be built from carrier body text"
+        );
+        let text: String = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(tb) => Some(tb.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, carrier, "the carrier content is delivered verbatim");
+    }
+
+    /// A declared carrier with one data-URI image attachment whose body
+    /// quotes a second data-URI marker: exactly one image block, built from
+    /// the declared attachment and never the quoted one, with the body text
+    /// verbatim around it.
+    #[test]
+    fn convert_messages_prompt_carrier_declared_image_builds_exactly_one_block() {
+        let declared = "data:image/png;base64,iVBORw0KGgo=";
+        let body = format!(
+            "source example: {} in prose",
+            image_marker("data:image/png;base64,QUJD")
+        );
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+            &body,
+            &[zeroclaw_api::media::RenderedMarker {
+                target: declared.to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            }],
+        );
+        let messages = vec![ChatMessage::user(carrier)];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        let images: Vec<&ImageBlock> = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image(w) => Some(&w.image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            images.len(),
+            1,
+            "exactly the declared attachment builds an image block"
+        );
+        assert_eq!(images[0].source.bytes, "iVBORw0KGgo=");
+        assert_eq!(images[0].format, "png");
+        let text: String = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(tb) => Some(tb.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        assert_eq!(
+            text, expected,
+            "the body text is verbatim in the rebuilt count-zero carrier"
+        );
+        assert!(
+            text.contains(&body),
+            "the quoted marker stays in the body verbatim"
+        );
+    }
+
+    /// Control for the carrier branch: a plain user message whose text carries
+    /// one data-URI marker still lifts it into exactly one image block, the
+    /// pre-carrier behavior of `parse_user_content_blocks` unchanged.
+    #[test]
+    fn convert_messages_user_text_marker_still_builds_image_block() {
+        let content = format!(
+            "look {}",
+            image_marker("data:image/png;base64,iVBORw0KGgo=")
+        );
+        let messages = vec![ChatMessage::user(content)];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        let images: Vec<&ImageBlock> = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image(w) => Some(&w.image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1, "the user-text marker still lifts");
+        assert_eq!(images[0].source.bytes, "iVBORw0KGgo=");
+        assert_eq!(images[0].format, "png");
     }
 
     #[test]
@@ -2200,6 +2529,35 @@ mod tests {
             assert!(
                 !bedrock_model_supports_prompt_caching(model),
                 "expected NO prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_unsupported_for_nova2() {
+        // Nova 2 models match the "nova" family but reject cachePoint with a
+        // 400 "extraneous key [cachePoint] is not permitted".
+        for model in [
+            "us.amazon.nova-2-lite-v1:0",
+            "amazon.nova-2-lite-v1:0",
+            "US.AMAZON.NOVA-2-LITE-V1:0",
+        ] {
+            assert!(
+                !bedrock_model_supports_prompt_caching(model),
+                "expected NO prompt caching support for {model}"
+            );
+        }
+        // First-generation Nova models keep caching (whose IDs must not be
+        // caught by the Nova 2 exclusion).
+        for model in [
+            "us.amazon.nova-lite-v1:0",
+            "amazon.nova-micro-v1:0",
+            "amazon.nova-pro-v1:0",
+            "amazon.nova-premier-v1:0",
+        ] {
+            assert!(
+                bedrock_model_supports_prompt_caching(model),
+                "expected prompt caching support for {model}"
             );
         }
     }

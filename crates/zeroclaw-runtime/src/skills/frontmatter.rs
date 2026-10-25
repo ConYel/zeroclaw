@@ -22,6 +22,10 @@ pub struct SkillFrontmatter {
     pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// When `true`, keeps this skill's instructions inlined in the system
+    /// prompt even in compact skill-prompt mode. See `Skill::always`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slash_options: Vec<SkillSlashOption>,
 }
@@ -81,6 +85,25 @@ impl SkillFrontmatter {
                 tab: zeroclaw_config::config::ConfigTab::None,
                 alias_source: None,
                 multiline: false,
+                setup: None,
+                application: Default::default(),
+            },
+            PropFieldInfo {
+                name: "always".to_string(),
+                category: "skill-frontmatter",
+                display_value: String::from("false"),
+                type_hint: "bool",
+                kind: PropKind::Bool,
+                is_secret: false,
+                enum_variants: None,
+                description: "Keep this skill's instructions inlined in the system prompt even in compact skill-prompt mode.",
+                derived_from_secret: false,
+                credential_class: None,
+                tab: zeroclaw_config::config::ConfigTab::None,
+                alias_source: None,
+                multiline: false,
+                setup: None,
+                application: Default::default(),
             },
         ]
     }
@@ -109,7 +132,9 @@ fn field(
         credential_class: None,
         tab: zeroclaw_config::config::ConfigTab::None,
         alias_source: None,
+        application: Default::default(),
         multiline: false,
+        setup: None,
     }
 }
 
@@ -122,7 +147,7 @@ mod tests {
         let fields = SkillFrontmatter::prop_fields();
         assert_eq!(
             fields.len(),
-            7,
+            8,
             "SkillFrontmatter::prop_fields drifted from struct definition; \
              update both when adding/removing FLAT fields (slash_options is \
              nested and deliberately excluded)"

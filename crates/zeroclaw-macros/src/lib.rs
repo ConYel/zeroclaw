@@ -13,20 +13,44 @@ fn is_compound_type(ty: &syn::Type) -> bool {
     let Some(ident) = type_path.path.segments.last().map(|s| &s.ident) else {
         return false;
     };
-    ident == "Vec" || ident == "HashMap" || ident == "PathBuf"
+    ident == "Vec" || ident == "HashMap"
 }
 
-/// Check if any `#[serde(...)]` attribute on the field contains `skip`.
+/// Check if any `#[serde(...)]` attribute on the field contains `skip` or
+/// `skip_serializing`, both of which keep the field out of property
+/// enumeration.
+///
+/// `skip_serializing` (the bare form, not `skip_serializing_if`) marks a
+/// write-only field: it may still deserialize, but it is never written back
+/// out. Such a field cannot be a settable property, because a `set_prop` on
+/// it is silently discarded by the next save and the value is gone after the
+/// following reload. Excluding it here keeps property enumeration limited to
+/// fields that actually survive a save/reload round-trip.
 fn has_serde_skip(field: &syn::Field) -> bool {
-    has_serde_meta(field, "skip")
+    has_serde_meta(field, "skip") || has_serde_meta(field, "skip_serializing")
 }
 
 fn has_serde_flatten(field: &syn::Field) -> bool {
     has_serde_meta(field, "flatten")
 }
 
+/// Check if any `#[serde(...)]` attribute on the field contains `default`
+/// (bare `default` or `default = "fn"`).
+fn has_serde_default(field: &syn::Field) -> bool {
+    has_serde_meta(field, "default")
+}
+
 fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
-    for attr in &field.attrs {
+    attrs_have_serde_meta(&field.attrs, ident)
+}
+
+/// Check if any `#[serde(...)]` attribute in `attrs` contains `ident`
+/// (bare `ident` or `ident = "fn"`). Shared by field-level checks
+/// (`has_serde_meta`) and struct/container-level checks (e.g. a struct
+/// carrying `#[serde(default)]` on itself, which makes all its fields
+/// optional at deserialize time regardless of their own attributes).
+fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
+    for attr in attrs {
         if attr.path().is_ident("serde")
             && let Ok(nested) = attr.parse_args_with(
                 syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
@@ -51,6 +75,11 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
 /// - `#[nested]` on a nested struct or `Option<StructWithSecrets>` field
 ///   delegates secret discovery and setting to the child.
 /// - `#[prefix = "channels.matrix"]` on the struct sets the dotted path prefix.
+/// - `#[application = "model_provider_refresh"]` on a struct classifies all
+///   emitted children, or on a scalar field classifies only that property.
+///   Unannotated properties require reload.
+/// - `#[field_metadata = "path::to::annotator"]` on a struct enriches its
+///   property fields after nested paths have been resolved.
 /// - `#[multiline]` on a string field hints surfaces to render a multi-line
 ///   text area (e.g. a PEM key body) instead of a single-line input.
 ///
@@ -122,10 +151,12 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         integration,
         resource_key,
         credential_class,
+        application,
         natural_key,
         tab,
         group,
-        multiline
+        multiline,
+        field_metadata
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -134,7 +165,24 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let prefix = extract_prefix(&input);
     let category = derive_category(&prefix);
-    let integration_descriptor_method = build_integration_descriptor_method(&input.attrs);
+    let struct_application = match extract_application(&input.attrs) {
+        Ok(Some(application)) => quote! {
+            for field in &mut fields {
+                field.application = #application;
+            }
+        },
+        Ok(None) => quote! {},
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let field_metadata_hook = match extract_field_metadata_hook(&input.attrs) {
+        Ok(Some(path)) => quote! { #path(self, &mut fields); },
+        Ok(None) => quote! {},
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let integration_descriptor_method = match build_integration_descriptor_method(&input.attrs) {
+        Ok(method) => method,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
@@ -215,6 +263,26 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let is_resource_key = has_attr(field, "resource_key");
         let is_multiline = has_attr(field, "multiline");
         let natural_key_field = extract_string_attr(&field.attrs, "natural_key");
+        let application = match extract_application(&field.attrs) {
+            Ok(application) => application,
+            Err(err) => return err.to_compile_error().into(),
+        };
+        let application_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
+        if application.is_some()
+            && (is_nested || is_compound_type(application_ty) || serde_skip || is_serde_flatten)
+        {
+            return syn::Error::new_spanned(
+                field,
+                "field application annotations require an emitted scalar property",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let field_application = application.unwrap_or_else(|| {
+            quote! {
+                crate::config::ApplicationCapability::ReloadRequired
+            }
+        });
         let credential_class_expr = match extract_credential_class(&field.attrs) {
             Ok(expr) => expr,
             Err(err) => return err.to_compile_error().into(),
@@ -310,9 +378,46 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 } else {
                     quote! { &mut self.#field_ident }
                 };
+                let container_type_hint = shape_ty.to_token_stream().to_string().replace(' ', "");
+                let container_type_hint_lit = container_type_hint.as_str();
+                // Display for the container row: sorted key names only (never
+                // values), or `<unset>` when the map is absent/empty. Shared by
+                // `prop_fields` and `get_prop` so the two never disagree.
+                let container_display = quote! {
+                    match #map_expr {
+                        Some(map) if !map.is_empty() => {
+                            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                            keys.sort_unstable();
+                            keys.join(", ")
+                        }
+                        _ => crate::config::UNSET_DISPLAY.to_string(),
+                    }
+                };
                 dynamic_secret_map_prop_fields.push(quote! {
+                    // Container row: always present, so surfaces can offer
+                    // "add key" on an empty map. Entries follow as
+                    // `<path>.<KEY>` rows in stable (sorted) order.
+                    fields.push(crate::config::PropFieldInfo {
+                        name: #full_name_lit.to_string(),
+                        category: #category_lit,
+                        display_value: #container_display,
+                        type_hint: #container_type_hint_lit,
+                        kind: crate::config::PropKind::SecretMap,
+                        is_secret: true,
+                        enum_variants: None::<fn() -> Vec<String>>,
+                        description: #description_lit,
+                        derived_from_secret: false,
+                        credential_class: #credential_class_expr,
+                        application: crate::config::ApplicationCapability::ReloadRequired,
+                        tab: #tab_token,
+                        alias_source: None,
+                        multiline: false,
+                        setup: None,
+                    });
                     if let Some(map) = #map_expr {
-                        for (key, value) in map {
+                        let mut entries: Vec<(&String, &String)> = map.iter().collect();
+                        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                        for (key, value) in entries {
                             fields.push(crate::config::PropFieldInfo {
                                 name: format!("{}.{}", #full_name_lit, key),
                                 category: #category_lit,
@@ -328,14 +433,19 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 description: #description_lit,
                                 derived_from_secret: false,
                                 credential_class: #credential_class_expr,
+                                application: crate::config::ApplicationCapability::ReloadRequired,
                                 tab: #tab_token,
                                 alias_source: None,
                                 multiline: false,
+                                setup: None,
                             });
                         }
                     }
                 });
                 dynamic_secret_map_get_prop.push(quote! {
+                    if name == #full_name_lit {
+                        return Ok(#container_display);
+                    }
                     if let Some(key) = name
                         .strip_prefix(#full_name_lit)
                         .and_then(|s| s.strip_prefix('.'))
@@ -349,16 +459,41 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
                 dynamic_secret_map_set_prop.push(quote! {
+                    if name == #full_name_lit {
+                        // `name` is struct-local here (a natural-key or map
+                        // parent strips its alias before delegating), so the
+                        // message refers to "this path" rather than echoing
+                        // a path the caller never typed.
+                        anyhow::bail!(
+                            "`{}` is a key/value map and cannot be set directly; \
+                             set one entry at a time as `<this path>.<KEY>` \
+                             (an empty value removes that entry)",
+                            #field_name_kebab,
+                        );
+                    }
                     if let Some(key) = name
                         .strip_prefix(#full_name_lit)
                         .and_then(|s| s.strip_prefix('.'))
                         .filter(|key| !key.is_empty())
                     {
-                        (#map_mut_expr).insert(key.to_string(), value_str.to_string());
+                        // An empty value removes the entry. Empty entries
+                        // already display as `<unset>`, and `config delete`
+                        // resets a property by setting it to "", so this
+                        // makes delete actually drop the key instead of
+                        // leaving `KEY = ""` behind (e.g. an empty env var
+                        // exported to an MCP child process).
+                        if value_str.is_empty() {
+                            (#map_mut_expr).remove(key);
+                        } else {
+                            (#map_mut_expr).insert(key.to_string(), value_str.to_string());
+                        }
                         return Ok(());
                     }
                 });
                 dynamic_secret_map_prop_is_secret.push(quote! {
+                    if name == #full_name_lit {
+                        return true;
+                    }
                     if name
                         .strip_prefix(#full_name_lit)
                         .and_then(|s| s.strip_prefix('.'))
@@ -388,6 +523,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 });
 
                 let field_name_lit = snake_to_kebab(&field_ident.to_string());
+                let section_path = if prefix.is_empty() {
+                    field_name_lit.clone()
+                } else {
+                    format!("{prefix}.{field_name_lit}")
+                };
                 let field_doc = extract_doc(&field.attrs);
                 let value_ty_name = value_ty.to_token_stream().to_string();
 
@@ -473,10 +613,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             self.#field_ident.keys().map(String::as_str),
                         ) {
                             let hm_key = hm_key.to_string();
-                            if let Some(inner) = self.#field_ident.get_mut(&hm_key)
-                                && let Ok(()) = inner.set_prop(&inner_name, value_str)
-                            {
-                                return Ok(());
+                            if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                return inner.set_prop(&inner_name, value_str);
                             }
                         }
                     });
@@ -601,6 +739,16 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+                    // Dotted outer keys make candidate splits ambiguous, so an
+                    // inner "Unknown property" must `continue` to the next
+                    // (shorter) outer-key split — mirroring get_prop's retry
+                    // loop above — while real value errors return (via
+                    // `crate::config::is_unknown_property_error`).
+                    let double_map_set_gate = build_set_prop_delegation_gate(
+                        quote! { inner.set_prop(&inner_name, value_str) },
+                        quote! { &inner_name },
+                        quote! { continue; },
+                    );
                     nested_set_prop.push(quote! {
                         {
                             let path_prefix = if Self::configurable_prefix().is_empty() {
@@ -636,9 +784,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                     };
                                     if let Some(inner_map) = self.#field_ident.get_mut(&outer_key)
                                         && let Some(inner) = inner_map.get_mut(&inner_key)
-                                        && inner.set_prop(&inner_name, value_str).is_ok()
                                     {
-                                        return Ok(());
+                                        #double_map_set_gate
                                     }
                                 }
                             }
@@ -682,15 +829,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // is actually creating.
                     map_key_section_entries.push(quote! {
                         out.push(crate::config::MapKeySection {
-                            path: {
-                                let prefix = Self::configurable_prefix();
-                                let s = if prefix.is_empty() {
-                                    #field_name_lit.to_string()
-                                } else {
-                                    format!("{prefix}.{}", #field_name_lit)
-                                };
-                                Box::leak(s.into_boxed_str())
-                            },
+                            path: #section_path,
                             kind: crate::config::MapKeyKind::Map,
                             value_type: #inner_ty_name,
                             description: #field_doc,
@@ -904,10 +1043,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             self.#field_ident.keys().map(String::as_str),
                         ) {
                             let hm_key = hm_key.to_string();
-                            if let Some(inner) = self.#field_ident.get_mut(&hm_key)
-                                && let Ok(()) = inner.set_prop(&inner_name, value_str)
-                            {
-                                return Ok(());
+                            if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                return inner.set_prop(&inner_name, value_str);
                             }
                         }
                     });
@@ -946,20 +1083,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // typed insertion. Both auto-derived — no hand-table.
                     map_key_section_entries.push(quote! {
                         out.push(crate::config::MapKeySection {
-                            // Path is computed at static-init time via the
-                            // configurable_prefix const + field name literal.
-                            path: {
-                                // SAFETY: leak-once for static lifetime; runs
-                                // exactly per (Type, field) pair, bounded by the
-                                // schema's field count.
-                                let prefix = Self::configurable_prefix();
-                                let s = if prefix.is_empty() {
-                                    #field_name_lit.to_string()
-                                } else {
-                                    format!("{prefix}.{}", #field_name_lit)
-                                };
-                                Box::leak(s.into_boxed_str())
-                            },
+                            path: #section_path,
                             kind: crate::config::MapKeyKind::Map,
                             value_type: #value_ty_name,
                             description: #field_doc,
@@ -1127,13 +1251,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     }
                 });
-                nested_set_prop.push(quote! {
-                    if let Some(inner) = &mut self.#field_ident {
-                        if let Ok(()) = inner.set_prop(name, value_str) {
-                            return Ok(());
-                        }
-                    }
-                });
                 nested_prop_is_secret.push(quote! {
                     // Extract inner type from Option for static dispatch
                     // We need to know the inner type at compile time
@@ -1142,13 +1259,40 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 // For Option<T> nested, extract inner type for Default::default
                 if let Some(inner_ty) = extract_option_inner(&field.ty) {
                     let inner_ty_tokens = quote! { #inner_ty };
+                    // Option<T> fields share the unstripped dotted namespace
+                    // with their siblings. A missing child must therefore be
+                    // probed transactionally: commit the default only when the
+                    // child accepts the property, preserve None for unrelated
+                    // paths or invalid values, and propagate real value errors.
+                    nested_set_prop.push(quote! {
+                        if let Some(inner) = &mut self.#field_ident {
+                            match inner.set_prop(name, value_str) {
+                                Err(e) if crate::config::is_unknown_property_error(&e, name) => {}
+                                other => return other,
+                            }
+                        } else {
+                            let mut probe = <#inner_ty_tokens as Default>::default();
+                            match probe.set_prop(name, value_str) {
+                                Ok(()) => {
+                                    self.#field_ident = Some(probe);
+                                    return Ok(());
+                                }
+                                Err(e) if crate::config::is_unknown_property_error(&e, name) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    });
                     init_defaults_ops.push(quote! {
                         if self.#field_ident.is_none() {
                             let child_prefix = <#inner_ty_tokens>::configurable_prefix();
                             let dominated = prefix.map_or(true, |p| {
                                 child_prefix.starts_with(p) || p.starts_with(child_prefix)
                             });
-                            if dominated {
+                            let explicitly_targeted = prefix.is_some_and(|p| p.starts_with(child_prefix));
+                            if dominated
+                                && (explicitly_targeted
+                                    || !<#inner_ty_tokens>::init_requires_explicit_config())
+                            {
                                 let mut probe = <#inner_ty_tokens as Default>::default();
                                 let child_results = probe.init_defaults(prefix);
                                 initialized.push(child_prefix);
@@ -1224,6 +1368,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
                 let field_doc = extract_doc(&field.attrs);
                 let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
+                let section_path = if prefix.is_empty() {
+                    vec_field_name_lit.clone()
+                } else {
+                    format!("{prefix}.{vec_field_name_lit}")
+                };
                 let vec_natural_key_token = match &natural_key_field {
                     Some(name) => quote! { Some(#name) },
                     None => quote! { None },
@@ -1240,15 +1389,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 }
                 map_key_section_entries.push(quote! {
                     out.push(crate::config::MapKeySection {
-                        path: {
-                            let prefix = Self::configurable_prefix();
-                            let s = if prefix.is_empty() {
-                                #vec_field_name_lit.to_string()
-                            } else {
-                                format!("{prefix}.{}", #vec_field_name_lit)
-                            };
-                            Box::leak(s.into_boxed_str())
-                        },
+                        path: #section_path,
                         kind: crate::config::MapKeyKind::List,
                         value_type: #vec_inner_name,
                         description: #field_doc,
@@ -1665,6 +1806,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+                    // Flattened fields share this struct's dotted namespace,
+                    // so an inner "Unknown property" falls through — sibling
+                    // own-fields and the generic leaf fallback must still get
+                    // their chance — while real value errors propagate
+                    // — see `build_set_prop_delegation_gate` /
+                    // `crate::config::is_unknown_property_error`.
+                    let flatten_set_gate = build_set_prop_delegation_gate(
+                        quote! { self.#field_ident.set_prop(&inner_name, value_str) },
+                        quote! { &inner_name },
+                        quote! {},
+                    );
                     nested_set_prop.push(quote! {
                         {
                             let outer_prefix = Self::configurable_prefix();
@@ -1680,9 +1832,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 } else {
                                     format!("{inner_prefix}.{leaf}")
                                 };
-                                if let Ok(()) = self.#field_ident.set_prop(&inner_name, value_str) {
-                                    return Ok(());
-                                }
+                                #flatten_set_gate
                             }
                         }
                     });
@@ -1967,42 +2117,83 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         description: #description_lit,
                         derived_from_secret: #derived_from_secret,
                         credential_class: #credential_class_expr,
+                        application: crate::config::ApplicationCapability::ReloadRequired,
                         tab: #tab_token,
                         alias_source: #alias_source_expr,
                         multiline: #is_multiline,
+                        setup: None,
                     }
                 }
             });
         } else {
             prop_field_entries.push(quote! {
-                crate::config::make_prop_field(
-                    __table.as_ref(),
-                    #full_name_lit,
-                    #serde_name_lit,
-                    #category_lit,
-                    #type_hint_lit,
-                    #kind_token,
-                    #is_secret,
-                    #enum_variants_expr,
-                    #description_lit,
-                    #derived_from_secret,
-                    #credential_class_expr,
-                    #tab_token,
-                    &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
-                    #alias_source_expr,
-                    #is_multiline,
-                )
+                {
+                    let mut field = crate::config::make_prop_field(
+                        __table.as_ref(),
+                        #full_name_lit,
+                        #serde_name_lit,
+                        #category_lit,
+                        #type_hint_lit,
+                        #kind_token,
+                        #is_secret,
+                        #enum_variants_expr,
+                        #description_lit,
+                        #derived_from_secret,
+                        #credential_class_expr,
+                        #tab_token,
+                        &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
+                        #alias_source_expr,
+                        #is_multiline,
+                    );
+                    field.application = #field_application;
+                    field
+                }
             });
         }
     }
 
     let prefix_lit = &prefix;
 
+    // True when this struct has a required leaf field that would break a
+    // scaffolded round-trip: a non-`#[nested]`, non-`Option<_>` field with
+    // no `#[serde(skip...)]`/`#[serde(flatten)]`/`#[serde(default...)]`,
+    // and the struct itself doesn't carry a container-level
+    // `#[serde(default)]` (which would make every field optional at
+    // deserialize time regardless of the field's own attributes).
+    //
+    // Used by `init_defaults` to gate whether a `#[nested] Option<T>`
+    // field may be scaffolded from `T::default()` when the caller did not
+    // explicitly target this section: scaffolding a struct like this
+    // fills the required field with its Rust `Default` (typically `""`
+    // for `String`), which `prune_empty_leaves` then strips on save,
+    // leaving a partial sub-table that fails strict reload. The scaffold
+    // site that consumes this flag is the `init_defaults_ops` gate above.
+    let init_requires_explicit_config: bool = !attrs_have_serde_meta(&input.attrs, "default")
+        && fields.iter().any(|f| {
+            !has_attr(f, "nested")
+                && !has_serde_skip(f)
+                && !has_serde_flatten(f)
+                && extract_option_inner(&f.ty).is_none()
+                && !has_serde_default(f)
+        });
+
     let expanded = quote! {
         impl #struct_name {
             /// Returns the `#[prefix]` value for this Configurable struct.
             pub fn configurable_prefix() -> &'static str {
                 #prefix_lit
+            }
+
+            /// True when this struct has a required leaf field that a
+            /// bare/ancestor-prefix `init_defaults` scaffold must not
+            /// materialize (it would fill the field with its Rust
+            /// `Default`, which `prune_empty_leaves` then strips on save,
+            /// leaving a partial sub-table that fails strict reload).
+            /// Explicitly targeting this section (or a descendant of it)
+            /// still scaffolds regardless of this flag, so the section can
+            /// be materialized for the operator to fill in.
+            pub fn init_requires_explicit_config() -> bool {
+                #init_requires_explicit_config
             }
 
             #integration_descriptor_method
@@ -2056,6 +2247,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let mut fields = vec![#(#prop_field_entries),*];
                 #(#nested_prop_fields)*
                 #(#dynamic_secret_map_prop_fields)*
+                #struct_application
+                #field_metadata_hook
                 fields
             }
 
@@ -2507,6 +2700,35 @@ fn extract_prefix(input: &DeriveInput) -> String {
     String::new()
 }
 
+fn extract_field_metadata_hook(attrs: &[syn::Attribute]) -> syn::Result<Option<syn::Path>> {
+    let mut hook = None;
+    for attr in attrs {
+        if !attr.path().is_ident("field_metadata") {
+            continue;
+        }
+        if hook.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "duplicate field_metadata hook",
+            ));
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected field_metadata = \"path\"",
+            ));
+        };
+        let syn::Expr::Lit(expr_lit) = &nv.value else {
+            return Err(syn::Error::new_spanned(&nv.value, "expected a path string"));
+        };
+        let Lit::Str(path) = &expr_lit.lit else {
+            return Err(syn::Error::new_spanned(&nv.value, "expected a path string"));
+        };
+        hook = Some(path.parse::<syn::Path>()?);
+    }
+    Ok(hook)
+}
+
 fn has_attr(field: &syn::Field, name: &str) -> bool {
     field.attrs.iter().any(|attr| attr.path().is_ident(name))
 }
@@ -2599,11 +2821,88 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
     })
 }
 
-fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
+fn extract_application(attrs: &[syn::Attribute]) -> syn::Result<Option<proc_macro2::TokenStream>> {
+    let mut application = None;
+    for attr in attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("application"))
+    {
+        if application.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "duplicate application annotation",
+            ));
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected #[application = \"model_provider_refresh\"]",
+            ));
+        };
+        let syn::Expr::Lit(expr) = &nv.value else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "application must be a string literal",
+            ));
+        };
+        let Lit::Str(value) = &expr.lit else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "application must be a string literal",
+            ));
+        };
+        let variant = match value.value().as_str() {
+            "reload_required" => quote! { ReloadRequired },
+            "model_provider_refresh" => quote! { ModelProviderRefresh },
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "unknown application; expected reload_required or model_provider_refresh",
+                ));
+            }
+        };
+        application = Some(quote! { crate::config::ApplicationCapability::#variant });
+    }
+    Ok(application)
+}
+
+/// Shared `set_prop` delegation gate for nested sites whose dotted namespace
+/// is (or may be) shared with sibling candidates: serde-flatten fields and
+/// the two-level dotted-key candidate loop.
+/// `Ok` and real value errors return immediately — the path is
+/// confirmed, so a failure is a value problem that must reach the caller.
+/// The generated "Unknown property" marker
+/// (`crate::config::is_unknown_property_error`) instead means "not one of
+/// mine": the site-specific `on_unknown` tokens run so the next candidate —
+/// a sibling field, the generic leaf fallback, or the next dotted-key split —
+/// still gets its chance.
+///
+/// `attempted_name` must be the exact `&str` expression for the property
+/// name passed into `call`'s nested `set_prop` — `is_unknown_property_error`
+/// compares against that exact name so a value error whose message merely
+/// starts with "Unknown property" isn't mistaken for the fall-through
+/// marker.
+fn build_set_prop_delegation_gate(
+    call: proc_macro2::TokenStream,
+    attempted_name: proc_macro2::TokenStream,
+    on_unknown: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    quote! {
+        match #call {
+            Err(e) if crate::config::is_unknown_property_error(&e, #attempted_name) => { #on_unknown }
+            other => return other,
+        }
+    }
+}
+
+fn build_integration_descriptor_method(
+    attrs: &[syn::Attribute],
+) -> syn::Result<proc_macro2::TokenStream> {
     let mut category: Option<String> = None;
     let mut display_name: Option<String> = None;
     let mut description: Option<String> = None;
-    let mut status_field: Option<String> = None;
+    let mut status_field: Option<syn::LitStr> = None;
+    let mut status_method: Option<syn::LitStr> = None;
     let mut found = false;
 
     for attr in attrs {
@@ -2625,34 +2924,59 @@ fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2:
             };
             let value = match &meta.value {
                 syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
-                    Lit::Str(s) => s.value(),
+                    Lit::Str(s) => s,
                     _ => continue,
                 },
                 _ => continue,
             };
             match key.as_str() {
-                "category" => category = Some(value),
-                "display_name" => display_name = Some(value),
-                "description" => description = Some(value),
-                "status_field" => status_field = Some(value),
+                "category" => category = Some(value.value()),
+                "display_name" => display_name = Some(value.value()),
+                "description" => description = Some(value.value()),
+                "status_field" => status_field = Some(value.clone()),
+                "status_method" => status_method = Some(value.clone()),
                 _ => {}
             }
         }
     }
 
     if !found {
-        return proc_macro2::TokenStream::new();
+        return Ok(proc_macro2::TokenStream::new());
     }
 
     let category_lit = category.unwrap_or_default();
     let display_name_lit = display_name.unwrap_or_default();
     let description_lit = description.unwrap_or_default();
-    let status_field_ident = match status_field {
-        Some(name) => syn::Ident::new(&name, proc_macro2::Span::call_site()),
-        None => syn::Ident::new("enabled", proc_macro2::Span::call_site()),
+    // Two ways to answer "is this integration active?". `status_field` names
+    // a single bool field and stays the default (`enabled`). `status_method`
+    // names a zero-argument `&self -> bool` method, for integrations whose
+    // activation is a predicate over several fields — e.g. a config that
+    // gates two separate tools on two independent flags, where neither flag
+    // alone is the operator-visible status. They are mutually exclusive:
+    // accepting both would give one descriptor two disagreeing sources.
+    let active_expr = match (status_field, status_method) {
+        (Some(_), Some(_)) => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`status_field` and `status_method` are mutually exclusive; use \
+                 `status_method` when activation depends on more than one field",
+            ));
+        }
+        (None, Some(method)) => {
+            let ident = method.parse::<syn::Ident>()?;
+            quote! { self.#ident() }
+        }
+        (Some(field), None) => {
+            let ident = field.parse::<syn::Ident>()?;
+            quote! { self.#ident }
+        }
+        (None, None) => {
+            let ident = syn::Ident::new("enabled", proc_macro2::Span::call_site());
+            quote! { self.#ident }
+        }
     };
 
-    quote! {
+    Ok(quote! {
         /// Auto-generated by `#[integration(...)]`. Returns the integration
         /// descriptor for this nested toggleable config so callers (e.g. the
         /// integrations registry) consume schema-side metadata instead of
@@ -2662,10 +2986,10 @@ fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2:
                 display_name: #display_name_lit,
                 description: #description_lit,
                 category: #category_lit,
-                active: self.#status_field_ident,
+                active: #active_expr,
             }
         }
-    }
+    })
 }
 
 /// Flatten a field's `///` doc comment into a single space-separated line.
@@ -2746,8 +3070,46 @@ fn extract_hashmap_value_type(ty: &syn::Type) -> Option<&syn::Type> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_application_annotation_accepts_only_known_literal_capabilities() {
+        let attrs = vec![syn::parse_quote!(#[application = "model_provider_refresh"])];
+        assert!(extract_application(&attrs).unwrap().is_some());
+        let attrs = vec![syn::parse_quote!(#[application = "reload_required"])];
+        assert!(extract_application(&attrs).unwrap().is_some());
+        assert!(extract_application(&[]).unwrap().is_none());
+        for attrs in [
+            vec![syn::parse_quote!(#[application = "unknown"])],
+            vec![syn::parse_quote!(#[application = 1])],
+            vec![syn::parse_quote!(#[application(model_provider_refresh)])],
+            vec![
+                syn::parse_quote!(#[application = "model_provider_refresh"]),
+                syn::parse_quote!(#[application = "reload_required"]),
+            ],
+        ] {
+            assert!(extract_application(&attrs).is_err());
+        }
+    }
+
     use super::*;
     use syn::parse_quote;
+
+    #[test]
+    fn field_metadata_hook_requires_a_valid_path() {
+        let valid: DeriveInput = parse_quote! {
+            #[field_metadata = "crate::setup::annotate_fields"]
+            struct RenamedConfig { value: String }
+        };
+        let path = extract_field_metadata_hook(&valid.attrs).unwrap().unwrap();
+        assert_eq!(
+            path.to_token_stream().to_string(),
+            "crate :: setup :: annotate_fields"
+        );
+        let invalid: DeriveInput = parse_quote! {
+            #[field_metadata = "crate::setup::annotate_fields()"]
+            struct RenamedConfig { value: String }
+        };
+        assert!(extract_field_metadata_hook(&invalid.attrs).is_err());
+    }
 
     #[test]
     fn snake_to_kebab_is_identity_passthrough() {
@@ -2793,6 +3155,25 @@ mod tests {
     }
 
     #[test]
+    fn has_serde_skip_detects_skip_serializing() {
+        // A write-only compatibility shim: it still deserializes (and
+        // discards what it read), but it is never serialized back out, so it
+        // must not be enumerated as a settable property.
+        let field: syn::Field = parse_quote! {
+            #[serde(default, skip_serializing, deserialize_with = "f")]
+            pub nevis: Option<serde_json::Value>
+        };
+        assert!(has_serde_skip(&field));
+
+        // Bare `skip_serializing` only: still skipped.
+        let field: syn::Field = parse_quote! {
+            #[serde(skip_serializing)]
+            pub shim: Option<String>
+        };
+        assert!(has_serde_skip(&field));
+    }
+
+    #[test]
     fn has_serde_skip_no_serde_attr() {
         let field: syn::Field = parse_quote! {
             pub name: String
@@ -2808,5 +3189,91 @@ mod tests {
             pub token: String
         };
         assert!(has_serde_skip(&field));
+    }
+
+    #[test]
+    fn integration_status_field_rejects_invalid_identifier() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "not-valid"
+            )]
+        }];
+
+        assert!(build_integration_descriptor_method(&attrs).is_err());
+    }
+
+    #[test]
+    fn integration_status_method_rejects_invalid_identifier() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_method = "not-valid"
+            )]
+        }];
+
+        assert!(build_integration_descriptor_method(&attrs).is_err());
+    }
+
+    #[test]
+    fn integration_rejects_status_field_and_status_method_together() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "enabled",
+                status_method = "integration_active"
+            )]
+        }];
+
+        assert!(
+            build_integration_descriptor_method(&attrs).is_err(),
+            "two status sources for one descriptor must be rejected"
+        );
+    }
+
+    #[test]
+    fn integration_status_method_emits_method_call() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_method = "integration_active"
+            )]
+        }];
+
+        let tokens = build_integration_descriptor_method(&attrs)
+            .expect("status_method descriptor must build")
+            .to_string();
+        assert!(
+            tokens.contains("active : self . integration_active ()"),
+            "expected a method call for the active field, got: {tokens}"
+        );
+    }
+
+    #[test]
+    fn integration_status_field_emits_field_access() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "enabled"
+            )]
+        }];
+
+        let tokens = build_integration_descriptor_method(&attrs)
+            .expect("status_field descriptor must build")
+            .to_string();
+        assert!(
+            tokens.contains("active : self . enabled ,"),
+            "expected a plain field read for the active field, got: {tokens}"
+        );
     }
 }

@@ -13,6 +13,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use zeroclaw_api::tool::ToolSpec;
 
 pub struct OpenRouterModelProvider {
@@ -22,11 +23,19 @@ pub struct OpenRouterModelProvider {
     timeout_secs: u64,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
+    #[cfg(test)]
+    streaming_base_url: Option<String>,
 }
 
 /// OpenRouter's public aggregator endpoint.
 pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+pub(crate) fn endpoint_url(path: &str) -> String {
+    format!("{BASE_URL}/{}", path.trim_start_matches('/'))
+}
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Maximum silence between body reads for OpenRouter SSE streams.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -194,38 +203,91 @@ struct NativeResponseMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
-impl OpenRouterModelProvider {
-    pub fn new(alias: &str, credential: Option<&str>, timeout_secs: Option<u64>) -> Self {
-        Self {
-            alias: alias.to_string(),
-            credential: credential.map(ToString::to_string),
-            timeout_secs: timeout_secs
-                .filter(|secs| *secs > 0)
-                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
-            max_tokens: None,
-            extra_body: None,
-        }
-    }
-    /// Override the HTTP request timeout for LLM API calls.
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.timeout_secs = secs;
+/// Typed builder for [`OpenRouterModelProvider`].
+///
+/// Only `alias` is required. `credential` treats whitespace-only inputs
+/// as missing (defensive against stray config values). Timeout,
+/// max_tokens, and extra_body all have sensible defaults.
+#[must_use]
+pub struct OpenRouterBuilder {
+    alias: String,
+    credential: Option<String>,
+    timeout_secs: Option<u64>,
+    max_tokens: Option<u32>,
+    extra_body: Option<serde_json::Value>,
+    #[cfg(test)]
+    streaming_base_url: Option<String>,
+}
+
+impl OpenRouterBuilder {
+    /// Explicit API credential. Whitespace-only inputs collapse to
+    /// `None`.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
         self
     }
 
-    /// Set the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+    /// Override the HTTP request timeout for LLM API calls. Values of 0
+    /// are ignored (the default timeout is kept) so a stray `Some(0)`
+    /// from config cannot disable the safety timeout.
+    pub fn timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
         self
     }
 
     /// Set extra JSON parameters to merge into every API request body.
-    /// Keys in `extra` are inserted at the top level of the serialized request,
-    /// overriding any existing keys with the same name.
-    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
+    /// Keys in `extra` are inserted at the top level of the serialized
+    /// request, overriding any existing keys with the same name.
+    pub fn extra_body(mut self, extra: serde_json::Value) -> Self {
         self.extra_body = Some(extra);
         self
     }
 
+    #[cfg(test)]
+    fn streaming_base_url(mut self, base_url: &str) -> Self {
+        self.streaming_base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub fn build(self) -> OpenRouterModelProvider {
+        OpenRouterModelProvider {
+            alias: self.alias,
+            credential: self.credential,
+            timeout_secs: self
+                .timeout_secs
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            max_tokens: self.max_tokens,
+            extra_body: self.extra_body,
+            #[cfg(test)]
+            streaming_base_url: self.streaming_base_url,
+        }
+    }
+}
+
+impl OpenRouterModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`OpenRouterBuilder`].
+    pub fn builder(alias: &str) -> OpenRouterBuilder {
+        OpenRouterBuilder {
+            alias: alias.to_string(),
+            credential: None,
+            timeout_secs: None,
+            max_tokens: None,
+            extra_body: None,
+            #[cfg(test)]
+            streaming_base_url: None,
+        }
+    }
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
@@ -258,13 +320,19 @@ impl OpenRouterModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| NativeToolCall {
-                            id: Some(tc.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
-                            },
+                        .map(|tc| {
+                            let name = tc.name;
+                            NativeToolCall {
+                                id: Some(tc.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tc.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content")
@@ -356,7 +424,7 @@ impl OpenRouterModelProvider {
             return MessageContent::Text(content.to_string());
         }
 
-        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
+        let (cleaned_text, image_refs) = multimodal::parse_user_message_image_refs(content);
         if image_refs.is_empty() {
             return MessageContent::Text(content.to_string());
         }
@@ -489,6 +557,30 @@ impl OpenRouterModelProvider {
             OPENROUTER_CONNECT_TIMEOUT_SECS,
         )
     }
+
+    /// HTTP client for streaming SSE connections. Streaming responses can
+    /// legitimately outlive the normal request timeout while still making
+    /// progress, so bound only connection setup and idle body reads here.
+    fn streaming_http_client(&self) -> Client {
+        self.streaming_http_client_with_idle_timeout(STREAM_IDLE_TIMEOUT)
+    }
+
+    fn streaming_http_client_with_idle_timeout(&self, idle_timeout: Duration) -> Client {
+        zeroclaw_config::schema::build_runtime_proxy_client_with_read_timeout(
+            "model_provider.openrouter",
+            idle_timeout.as_secs(),
+            OPENROUTER_CONNECT_TIMEOUT_SECS,
+        )
+    }
+
+    fn streaming_endpoint_url(&self, path: &str) -> String {
+        #[cfg(test)]
+        if let Some(base_url) = self.streaming_base_url.as_deref() {
+            return format!("{base_url}/{}", path.trim_start_matches('/'));
+        }
+
+        endpoint_url(path)
+    }
 }
 
 #[async_trait]
@@ -512,7 +604,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
             self.http_client()
-                .get("https://openrouter.ai/api/v1/auth/key")
+                .get(endpoint_url("auth/key"))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
                 .await?
@@ -526,7 +618,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // Returns ~300 models across every model_provider OpenRouter proxies.
         let response = self
             .http_client()
-            .get("https://openrouter.ai/api/v1/models")
+            .get(endpoint_url("models"))
             .send()
             .await?
             .error_for_status()?;
@@ -566,7 +658,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
+                "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
             )
         })?;
 
@@ -581,10 +673,11 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -631,7 +724,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
+                "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
             )
         })?;
 
@@ -653,10 +746,11 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -703,7 +797,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
+                "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
             )
         })?;
 
@@ -723,10 +817,11 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -749,6 +844,7 @@ impl ModelProvider for OpenRouterModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -797,7 +893,8 @@ impl ModelProvider for OpenRouterModelProvider {
             None => {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
-                        "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.".to_string(),
+                        "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+                            .to_string(),
                     ))
                 })
                 .boxed();
@@ -817,24 +914,30 @@ impl ModelProvider for OpenRouterModelProvider {
             stream: Some(true),
         };
 
-        let payload = match serde_json::to_value(&native_request) {
+        let payload = match self.merge_extra_body(&native_request) {
             Ok(v) => v,
             Err(e) => {
-                return stream::once(async move { Err(StreamError::Json(e)) }).boxed();
+                let error = match e.downcast::<serde_json::Error>() {
+                    Ok(e) => StreamError::Json(e),
+                    Err(e) => StreamError::ModelProvider(e.to_string()),
+                };
+                return stream::once(async move { Err(error) }).boxed();
             }
         };
 
-        let client = self.http_client();
+        let client = self.streaming_http_client();
+        let endpoint_url = self.streaming_endpoint_url("chat/completions");
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
             let response = match client
-                .post("https://openrouter.ai/api/v1/chat/completions")
+                .post(endpoint_url)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
+                .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
                 .header("Accept", "text/event-stream")
                 .json(&payload)
                 .send()
@@ -843,7 +946,11 @@ impl ModelProvider for OpenRouterModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::format_error_chain(&e))
+                        } else {
+                            StreamError::Http(super::format_error_chain(&e))
+                        }))
                         .await;
                     return;
                 }
@@ -895,7 +1002,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
+                "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
             )
         })?;
 
@@ -947,10 +1054,11 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -973,6 +1081,7 @@ impl ModelProvider for OpenRouterModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -1024,8 +1133,9 @@ mod tests {
 
     #[test]
     fn capabilities_report_vision_support() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
         let caps = <OpenRouterModelProvider as ModelProvider>::capabilities(&model_provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -1033,15 +1143,17 @@ mod tests {
 
     #[test]
     fn supports_streaming_returns_true() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
         assert!(model_provider.supports_streaming());
     }
 
     #[test]
     fn supports_streaming_tool_events_returns_true() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
         assert!(model_provider.supports_streaming_tool_events());
     }
 
@@ -1050,7 +1162,9 @@ mod tests {
         use crate::traits::{ChatMessage, ChatRequest};
         use futures_util::StreamExt as _;
 
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
@@ -1078,9 +1192,9 @@ mod tests {
         assert!(first.is_err(), "expected error without API key");
         let err = first.unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("API key not set"),
-            "error should mention API key: {msg}"
+        assert_eq!(
+            msg,
+            "ModelProvider error: OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
         );
     }
 
@@ -1089,7 +1203,9 @@ mod tests {
         use crate::traits::{ChatMessage, ChatRequest, StreamEvent};
         use futures_util::StreamExt as _;
 
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
@@ -1115,6 +1231,161 @@ mod tests {
             .await
             .expect("stream should yield Final immediately");
         assert!(matches!(first, Ok(StreamEvent::Final)));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_allows_active_stream_past_request_timeout() {
+        use axum::{Json, Router, body::Body, http::header, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|Json(payload): Json<serde_json::Value>| async move {
+                assert_eq!(payload["stream"], serde_json::Value::Bool(true));
+                let first = futures_util::stream::once(async {
+                    Ok::<_, Infallible>(axum::body::Bytes::from_static(
+                        br#"data: {"choices":[{"delta":{"content":"first"},"finish_reason":null}]}
+
+"#,
+                    ))
+                });
+                let second = futures_util::stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(1100)).await;
+                    Ok::<_, Infallible>(axum::body::Bytes::from_static(
+                        br#"data: {"choices":[{"delta":{"content":"second"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+                    ))
+                });
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(first.chain(second)),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OpenRouter streaming test server");
+        let addr = listener
+            .local_addr()
+            .expect("OpenRouter streaming test address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve OpenRouter streaming test");
+        });
+
+        let provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .timeout_secs(1)
+            .streaming_base_url(&format!("http://{addr}"))
+            .build();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let request = crate::traits::ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let mut stream = provider.stream_chat(
+            request,
+            "anthropic/claude-haiku-4-5",
+            Some(0.0),
+            crate::traits::StreamOptions::new(true),
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream should yield the first SSE event")
+            .expect("stream should yield at least one event")
+            .expect("first SSE event should be readable");
+        match first {
+            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "first"),
+            event => panic!("expected first text delta, got {event:?}"),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("stream should remain open past the request timeout")
+            .expect("stream should yield the second SSE event")
+            .expect("second SSE event should be readable");
+        match second {
+            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "second"),
+            event => panic!("expected second text delta, got {event:?}"),
+        }
+
+        let final_event = stream.next().await.expect("stream should yield Final");
+        assert!(matches!(final_event, Ok(StreamEvent::Final)));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_client_times_out_when_response_body_is_silent() {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OpenRouter idle-timeout test server");
+        let addr = listener
+            .local_addr()
+            .expect("OpenRouter idle-timeout test address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("accept OpenRouter idle-timeout test request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n7\r\ninitial\r\n",
+                )
+                .await
+                .expect("write initial OpenRouter idle-timeout test chunk");
+            socket
+                .flush()
+                .await
+                .expect("flush initial OpenRouter idle-timeout test chunk");
+            futures_util::future::pending::<()>().await;
+        });
+
+        let provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let response = provider
+            .streaming_http_client_with_idle_timeout(Duration::from_secs(1))
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .expect("silent streaming request should receive headers");
+        let mut body = response.bytes_stream();
+        assert_eq!(
+            body.next()
+                .await
+                .expect("initial stream chunk")
+                .expect("initial stream chunk should be readable"),
+            axum::body::Bytes::from_static(b"initial")
+        );
+        let result = tokio::time::timeout(Duration::from_secs(3), body.next())
+            .await
+            .expect("silent stream should hit the idle timeout")
+            .expect("silent stream should yield a timeout error");
+        assert!(
+            result.is_err(),
+            "silent stream should fail after idle timeout"
+        );
+
+        server.abort();
     }
 
     #[test]
@@ -1149,8 +1420,9 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
         assert_eq!(
             model_provider.credential.as_deref(),
             Some("openrouter-test-credential")
@@ -1159,21 +1431,41 @@ mod tests {
 
     #[test]
     fn creates_without_key() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         assert!(model_provider.credential.is_none());
     }
 
     #[test]
+    fn warmup_and_model_discovery_urls_share_the_provider_base() {
+        assert_eq!(
+            endpoint_url("auth/key"),
+            "https://openrouter.ai/api/v1/auth/key",
+            "warmup must derive its URL from the provider-owned base"
+        );
+        assert_eq!(
+            endpoint_url("models"),
+            "https://openrouter.ai/api/v1/models",
+            "model discovery must derive its URL from the provider-owned base"
+        );
+    }
+
+    #[test]
     fn uses_configured_timeout_when_provided() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), Some(1200));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .timeout_secs(1200)
+            .build();
         assert_eq!(model_provider.timeout_secs, 1200);
     }
 
     #[test]
     fn falls_back_to_default_timeout_for_zero() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), Some(0));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .timeout_secs(0)
+            .build();
         assert_eq!(
             model_provider.timeout_secs,
             zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS
@@ -1182,25 +1474,55 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = model_provider
             .chat_with_system(Some("system"), "hello", "openai/gpt-4o", Some(0.2))
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key not set"));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_fails_without_key() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let result = model_provider
+            .chat(request, "openai/gpt-4o", Some(0.2))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+        );
     }
 
     #[tokio::test]
     async fn chat_with_history_fails_without_key() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
@@ -1217,7 +1539,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key not set"));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+        );
     }
 
     #[test]
@@ -1335,7 +1660,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "What is the date?".into(),
@@ -1354,7 +1681,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key not set"));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+        );
     }
 
     #[test]
@@ -1674,6 +2004,7 @@ mod tests {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                cache_creation_input_tokens: None,
             })
             .expect("usage should be Some");
         assert_eq!(usage.input_tokens, Some(25000));
@@ -1694,6 +2025,7 @@ mod tests {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                cache_creation_input_tokens: None,
             })
             .expect("usage should be Some");
         assert!(
@@ -1799,6 +2131,66 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // A malformed arguments string in the assistant history must be
+        // normalized to "{}" so the outbound chat-completions request doesn't
+        // 400 on strict upstreams. This test pins that the openrouter call site
+        // of `sanitize_tool_arguments` is wired in; the helper contract itself
+        // is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON object must round-trip byte-for-byte
+        // so the openrouter call site cannot accidentally re-encode or strip
+        // good payloads.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_rejects_non_object_tool_arguments() {
+        // Strict providers (Cohere, OpenRouter auto-exacto) require a JSON
+        // object for tool-call arguments. Null, arrays, strings, numbers, and
+        // booleans are valid JSON but must not reach the upstream.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"testing","tool_calls":[{"id":"c1","name":"f","arguments":"null"},{"id":"c2","name":"g","arguments":"[]"},{"id":"c3","name":"h","arguments":"42"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 3);
+        for tc in tool_calls {
+            assert_eq!(
+                tc.function.arguments, "{}",
+                "non-object arg for {} must normalize to empty object",
+                tc.function.name
+            );
+        }
+    }
+
+    #[test]
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
@@ -1831,14 +2223,18 @@ mod tests {
 
     #[test]
     fn default_timeout_is_120() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
         assert_eq!(model_provider.timeout_secs, 120);
     }
 
     #[test]
-    fn with_timeout_secs_overrides_default() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("key"), None).with_timeout_secs(300);
+    fn timeout_secs_overrides_default() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .timeout_secs(300)
+            .build();
         assert_eq!(model_provider.timeout_secs, 300);
     }
 
@@ -1939,16 +2335,20 @@ mod tests {
     }
 
     #[test]
-    fn with_extra_body_sets_value() {
+    fn extra_body_sets_value() {
         let extra = serde_json::json!({"model_provider": {"only": ["Anthropic"]}});
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("key"), None).with_extra_body(extra.clone());
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(extra.clone())
+            .build();
         assert_eq!(model_provider.extra_body, Some(extra));
     }
 
     #[test]
     fn extra_body_none_produces_unchanged_request() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -1963,8 +2363,10 @@ mod tests {
 
     #[test]
     fn extra_body_empty_object_produces_unchanged_request() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
-            .with_extra_body(serde_json::json!({}));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -1979,8 +2381,10 @@ mod tests {
 
     #[test]
     fn extra_body_adds_new_top_level_keys() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
-            .with_extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2000,8 +2404,10 @@ mod tests {
 
     #[test]
     fn extra_body_overrides_existing_keys() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
-            .with_extra_body(serde_json::json!({"temperature": 0.9}));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"temperature": 0.9}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2016,8 +2422,10 @@ mod tests {
 
     #[test]
     fn extra_body_merges_at_top_level_not_nested() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
-            .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"transforms": ["middle-out"]}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2035,10 +2443,10 @@ mod tests {
     }
 
     #[test]
-    fn extra_body_with_nested_provider_routing() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None).with_extra_body(
+    fn streaming_extra_body_with_nested_provider_routing() {
+        let model_provider = OpenRouterModelProvider::builder("test").credential(Some("key")).extra_body(
             serde_json::json!({"model_provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
-        );
+        ).build();
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![],
@@ -2046,7 +2454,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
-            stream: None,
+            stream: Some(true),
         };
 
         let merged = model_provider.merge_extra_body(&request).unwrap();
@@ -2054,6 +2462,48 @@ mod tests {
         let prov = obj.get("model_provider").unwrap();
         assert_eq!(prov["only"], serde_json::json!(["Anthropic"]));
         assert_eq!(prov["allow_fallbacks"], false);
+        assert_eq!(obj.get("stream"), Some(&serde_json::json!(true)));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_rejects_non_object_extra_body_before_request() {
+        use crate::traits::{ChatRequest, StreamOptions};
+        use futures_util::StreamExt as _;
+
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!(["invalid"]))
+            .build();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+
+        let mut stream = model_provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "anthropic/claude-haiku-4-5",
+            Some(0.0),
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let error = stream
+            .next()
+            .await
+            .expect("stream should yield the request-body error")
+            .expect_err("non-object provider_extra should fail before the request");
+        assert!(
+            error
+                .to_string()
+                .contains("provider_extra must be a JSON object"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
